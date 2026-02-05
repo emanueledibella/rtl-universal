@@ -1,12 +1,13 @@
 // wfm_live.c
 // Minimal WFM (FM broadcast) mono receiver: RTL-SDR -> FM demod -> PortAudio
 // Build (Homebrew):
-//   cc -O2 -std=c11 wfm_live.c -o wfm_live $(pkg-config --cflags --libs librtlsdr portaudio-2.0) -lm
+//   cc -O2 -std=c11 wfm_live.c modules/ais_decoder.c -o wfm_live $(pkg-config --cflags --libs librtlsdr portaudio-2.0) -lm
 //
 // Run:
-//   ./wfm_live 100.0   (MHz)
-// Optional gain (dB) as second arg:
-//   ./wfm_live 100.0 20
+//   ./wfm_live 100.0   (MHz)             [voice default]
+// Optional gain (dB) and mode:
+//   ./wfm_live 100.0 20 voice
+//   ./wfm_live 162.0 --mode ais
 //
 // Notes:
 // - Uses async read (stable like rtl_fm).
@@ -21,9 +22,11 @@
 #include <math.h>
 #include <signal.h>
 #include <string.h>
+#include <ctype.h>
 
 #include <rtl-sdr.h>
 #include <portaudio.h>
+#include "modules/header/ais_decoder.h"
 
 #define SDR_FS        2400000   // 2.4 MS/s
 #define FS1           240000    // after decim1=10
@@ -39,10 +42,24 @@
 static volatile int g_stop = 0;
 static rtlsdr_dev_t* g_dev = NULL;
 
+// AIS
+static ais_ctx_t g_ais;
+
+
 static void on_sigint(int sig) {
     (void)sig;
     g_stop = 1;
     if (g_dev) rtlsdr_cancel_async(g_dev);
+}
+
+static int streq_icase(const char* a, const char* b) {
+    if (!a || !b) return 0;
+    while (*a && *b) {
+        if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) return 0;
+        a++;
+        b++;
+    }
+    return *a == '\0' && *b == '\0';
 }
 
 // Simple ring buffer for float mono audio
@@ -142,9 +159,48 @@ typedef struct {
     // Small temp audio buffer
     float audio_tmp[4096];
     uint32_t audio_tmp_len;
+
+    // Small temp AIS buffer (raw demod @ 48k)
+    float ais_tmp[4096];
+    uint32_t ais_tmp_len;
+    
 } dsp_state_t;
 
 static dsp_state_t g_dsp;
+
+// --------- Decoder interface ----------
+typedef struct {
+    const char* name;
+    int needs_audio; // 1 = uses PortAudio output
+    void (*init)(int fs_demod);
+    void (*process_sample)(float sample);
+    void (*flush)(void);
+} decoder_ops_t;
+
+static void voice_init(int fs_demod);
+static void voice_process_sample(float sample);
+static void voice_flush(void);
+static void ais_init_decoder(int fs_demod);
+static void ais_process_sample(float sample);
+static void ais_flush(void);
+
+// Add new decoders here.
+static const decoder_ops_t g_decoders[] = {
+    { "voice", 1, voice_init, voice_process_sample, voice_flush },
+    { "ais",   0, ais_init_decoder, ais_process_sample, ais_flush },
+    { NULL,    0, NULL, NULL, NULL }
+};
+
+static const decoder_ops_t* g_decoder = NULL;
+
+static const decoder_ops_t* find_decoder(const char* name) {
+    if (!name) return NULL;
+    if (streq_icase(name, "voce")) name = "voice";
+    for (int i = 0; g_decoders[i].name; i++) {
+        if (streq_icase(name, g_decoders[i].name)) return &g_decoders[i];
+    }
+    return NULL;
+}
 
 static void rtlsdr_cb(unsigned char* buf, uint32_t len, void* ctx) {
     (void)ctx;
@@ -191,41 +247,126 @@ static void rtlsdr_cb(unsigned char* buf, uint32_t len, void* ctx) {
                 float a = g_dsp.acc2 / (float)DECIM2;
                 g_dsp.acc2 = 0.0f;
                 g_dsp.acc2_count = 0;
-
-                // De-emphasis (EU 50us)
-                a = deemph_process(&g_deemph, a);
-
-                // Append to temp buffer
-                g_dsp.audio_tmp[g_dsp.audio_tmp_len++] = a;
-
-                // Flush periodically
-                if (g_dsp.audio_tmp_len >= 2048) {
-                    // Remove DC and normalize lightly
-                    float mean = 0.0f;
-                    for (uint32_t k = 0; k < g_dsp.audio_tmp_len; k++) mean += g_dsp.audio_tmp[k];
-                    mean /= (float)g_dsp.audio_tmp_len;
-                    for (uint32_t k = 0; k < g_dsp.audio_tmp_len; k++) g_dsp.audio_tmp[k] -= mean;
-
-                    normalize_block(g_dsp.audio_tmp, g_dsp.audio_tmp_len, 0.5f);
-                    ring_push(g_dsp.audio_tmp, g_dsp.audio_tmp_len);
-                    g_dsp.audio_tmp_len = 0;
+                if (g_decoder && g_decoder->process_sample) {
+                    g_decoder->process_sample(a);
                 }
             }
         }
     }
 }
 
+// --------- Decoder implementations ----------
+static void voice_flush_block(void) {
+    if (g_dsp.audio_tmp_len == 0) return;
+
+    // Remove DC and normalize lightly
+    float mean = 0.0f;
+    for (uint32_t k = 0; k < g_dsp.audio_tmp_len; k++) mean += g_dsp.audio_tmp[k];
+    mean /= (float)g_dsp.audio_tmp_len;
+    for (uint32_t k = 0; k < g_dsp.audio_tmp_len; k++) g_dsp.audio_tmp[k] -= mean;
+
+    normalize_block(g_dsp.audio_tmp, g_dsp.audio_tmp_len, 0.5f);
+    ring_push(g_dsp.audio_tmp, g_dsp.audio_tmp_len);
+    g_dsp.audio_tmp_len = 0;
+}
+
+static void voice_init(int fs_demod) {
+    const float tau = 50e-6f;
+    g_deemph.a = expf(-1.0f / ((float)fs_demod * tau));
+    g_deemph.y1 = 0.0f;
+    g_dsp.audio_tmp_len = 0;
+}
+
+static void voice_process_sample(float sample) {
+    float a = deemph_process(&g_deemph, sample);
+    g_dsp.audio_tmp[g_dsp.audio_tmp_len++] = a;
+    if (g_dsp.audio_tmp_len >= 2048) {
+        voice_flush_block();
+    }
+}
+
+static void voice_flush(void) {
+    voice_flush_block();
+}
+
+static void ais_init_decoder(int fs_demod) {
+    ais_init(&g_ais, fs_demod);
+    g_dsp.ais_tmp_len = 0;
+}
+
+static void ais_process_sample(float sample) {
+    g_dsp.ais_tmp[g_dsp.ais_tmp_len++] = sample;
+    if (g_dsp.ais_tmp_len >= 4096) {
+        ais_feed_samples(&g_ais, g_dsp.ais_tmp, g_dsp.ais_tmp_len);
+        g_dsp.ais_tmp_len = 0;
+    }
+}
+
+static void ais_flush(void) {
+    if (g_dsp.ais_tmp_len == 0) return;
+    ais_feed_samples(&g_ais, g_dsp.ais_tmp, g_dsp.ais_tmp_len);
+    g_dsp.ais_tmp_len = 0;
+}
+
 static void usage(const char* prog) {
-    fprintf(stderr, "Usage: %s <freq_mhz> [gain]\n", prog);
-    fprintf(stderr, "Example: %s 100.0 20\n", prog);
+    fprintf(stderr, "Usage: %s <freq_mhz> [gain_db] [mode]\n", prog);
+    fprintf(stderr, "       %s <freq_mhz> [gain_db] --mode <voice|ais>\n", prog);
+    fprintf(stderr, "Example: %s 100.0 20 voice\n", prog);
+    fprintf(stderr, "         %s 162.0 --mode ais\n", prog);
+}
+
+static int parse_int_arg(const char* s, int* out) {
+    char* end = NULL;
+    long v = strtol(s, &end, 10);
+    if (s == end || *end != '\0') return 0;
+    *out = (int)v;
+    return 1;
 }
 
 int main(int argc, char** argv) {
     signal(SIGINT, on_sigint);
     char* freq_opt = argv[1];
-    char* gain_opt = argv[2];
 
     if (argc < 2) {
+        usage(argv[0]);
+        return 1;
+    }
+
+    const char* decoder_name = "voice";
+    int gain = 0;
+    int use_manual_gain = 0;
+
+    for (int i = 2; i < argc; i++) {
+        const char* arg = argv[i];
+        if (strcmp(arg, "--mode") == 0 || strcmp(arg, "--decoder") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Missing value for %s\n", arg);
+                usage(argv[0]);
+                return 1;
+            }
+            decoder_name = argv[++i];
+            continue;
+        }
+        if (streq_icase(arg, "voice") || streq_icase(arg, "voce") || streq_icase(arg, "ais")) {
+            decoder_name = arg;
+            continue;
+        }
+        if (!use_manual_gain) {
+            int parsed_gain = 0;
+            if (parse_int_arg(arg, &parsed_gain)) {
+                gain = parsed_gain;
+                use_manual_gain = 1;
+                continue;
+            }
+        }
+        fprintf(stderr, "Unknown argument: %s\n", arg);
+        usage(argv[0]);
+        return 1;
+    }
+
+    g_decoder = find_decoder(decoder_name);
+    if (!g_decoder) {
+        fprintf(stderr, "Unknown mode/decoder: %s\n", decoder_name);
         usage(argv[0]);
         return 1;
     }
@@ -237,21 +378,9 @@ int main(int argc, char** argv) {
     }
     uint32_t freq_hz = (uint32_t)(freq_mhz * 1e6);
 
-    int gain = 0; // 0 means auto in librtlsdr API? We'll set manual if provided
-    int use_manual_gain = 0;
-    if (argc >= 3) {
-        gain = atoi(gain_opt);
-        use_manual_gain = 1;
-    }
-
-    // De-emphasis alpha
-    // a = exp(-1/(fs*tau))
-    const float tau = 50e-6f;
-    g_deemph.a = expf(-1.0f / ((float)AUDIO_FS * tau));
-    g_deemph.y1 = 0.0f;
-
     memset(&g_ring, 0, sizeof(g_ring));
     memset(&g_dsp, 0, sizeof(g_dsp));
+    if (g_decoder->init) g_decoder->init(AUDIO_FS);
 
     // ---- init RTL-SDR ----
     rtlsdr_dev_t* dev = NULL;
@@ -278,45 +407,55 @@ int main(int argc, char** argv) {
     // Reset buffer
     rtlsdr_reset_buffer(dev);
 
+    char gain_desc[32];
+    if (use_manual_gain) {
+        snprintf(gain_desc, sizeof(gain_desc), "%d dB", gain);
+    } else {
+        snprintf(gain_desc, sizeof(gain_desc), "auto");
+    }
+
     printf("START WFM C (async)\n");
-    printf("  freq=%.3f MHz | sdr_fs=%d | audio_fs=%d | gain=%s\n",
-           freq_mhz, SDR_FS, AUDIO_FS, use_manual_gain ? gain_opt : "auto");
+    printf("  freq=%.3f MHz | sdr_fs=%d | audio_fs=%d | gain=%s | mode=%s\n",
+           freq_mhz, SDR_FS, AUDIO_FS, gain_desc, g_decoder->name);
     printf("  Ctrl+C to stop\n");
 
-    // ---- init PortAudio ----
-    PaError pe = Pa_Initialize();
-    if (pe != paNoError) {
-        fprintf(stderr, "Pa_Initialize error: %s\n", Pa_GetErrorText(pe));
-        g_dev = NULL;
-        rtlsdr_close(dev);
-        return 1;
-    }
-
     PaStream* stream = NULL;
-    pe = Pa_OpenDefaultStream(&stream,
-                              0,          // no input
-                              1,          // mono output
-                              paFloat32,  // float32 output
-                              AUDIO_FS,
-                              1024,       // frames per buffer
-                              pa_cb,
-                              NULL);
-    if (pe != paNoError) {
-        fprintf(stderr, "Pa_OpenDefaultStream error: %s\n", Pa_GetErrorText(pe));
-        Pa_Terminate();
-        g_dev = NULL;
-        rtlsdr_close(dev);
-        return 1;
-    }
+    PaError pe = paNoError;
+    if (g_decoder->needs_audio) {
+        // ---- init PortAudio ----
+        pe = Pa_Initialize();
+        if (pe != paNoError) {
+            fprintf(stderr, "Pa_Initialize error: %s\n", Pa_GetErrorText(pe));
+            g_dev = NULL;
+            rtlsdr_close(dev);
+            return 1;
+        }
 
-    pe = Pa_StartStream(stream);
-    if (pe != paNoError) {
-        fprintf(stderr, "Pa_StartStream error: %s\n", Pa_GetErrorText(pe));
-        Pa_CloseStream(stream);
-        Pa_Terminate();
-        g_dev = NULL;
-        rtlsdr_close(dev);
-        return 1;
+        pe = Pa_OpenDefaultStream(&stream,
+                                  0,          // no input
+                                  1,          // mono output
+                                  paFloat32,  // float32 output
+                                  AUDIO_FS,
+                                  1024,       // frames per buffer
+                                  pa_cb,
+                                  NULL);
+        if (pe != paNoError) {
+            fprintf(stderr, "Pa_OpenDefaultStream error: %s\n", Pa_GetErrorText(pe));
+            Pa_Terminate();
+            g_dev = NULL;
+            rtlsdr_close(dev);
+            return 1;
+        }
+
+        pe = Pa_StartStream(stream);
+        if (pe != paNoError) {
+            fprintf(stderr, "Pa_StartStream error: %s\n", Pa_GetErrorText(pe));
+            Pa_CloseStream(stream);
+            Pa_Terminate();
+            g_dev = NULL;
+            rtlsdr_close(dev);
+            return 1;
+        }
     }
 
     // ---- start async RTL read (blocking call) ----
@@ -326,9 +465,12 @@ int main(int argc, char** argv) {
 
     // Cleanup
     g_stop = 1;
-    Pa_StopStream(stream);
-    Pa_CloseStream(stream);
-    Pa_Terminate();
+    if (g_decoder && g_decoder->flush) g_decoder->flush();
+    if (g_decoder->needs_audio) {
+        Pa_StopStream(stream);
+        Pa_CloseStream(stream);
+        Pa_Terminate();
+    }
 
     g_dev = NULL;
     rtlsdr_close(dev);
