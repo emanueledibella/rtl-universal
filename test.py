@@ -1,151 +1,160 @@
 import numpy as np
+import threading, time
+from collections import deque
+
 from rtlsdr import RtlSdr
 import sounddevice as sd
-from scipy.signal import firwin, lfilter, resample_poly
+from scipy.signal import firwin, lfilter
 
-def design_lowpass(cut_hz: float, fs: float, numtaps: int = 129):
-    return firwin(numtaps, cut_hz, fs=fs)
+
+def fir_lowpass(cut_hz: float, fs: float, numtaps: int = 129):
+    return firwin(numtaps, cut_hz, fs=fs).astype(np.float32)
 
 def fm_demod(iq: np.ndarray) -> np.ndarray:
-    # Quadrature FM discriminator: angle(x[n] * conj(x[n-1]))
     prod = iq[1:] * np.conj(iq[:-1])
-    return np.angle(prod)
+    return np.angle(prod).astype(np.float32)
 
-import numpy as np
+def deemphasis_iir(x: np.ndarray, fs: float, tau: float, zi: float):
+    # 1-pole IIR: y[n]=(1-a)x[n]+a y[n-1]
+    a = float(np.exp(-1.0 / (fs * tau)))
+    b = np.array([1.0 - a], dtype=np.float32)
+    a_coeff = np.array([1.0, -a], dtype=np.float32)
+    y, zf = lfilter(b, a_coeff, x, zi=[zi])
+    return y.astype(np.float32), float(zf[0])
 
 
-# ESEMPIO USO (commenta quando non ti serve):
-# t, m, f_inst, f_est, s = _test_fm_instantaneous_frequency(tone_hz=1000, dev_hz=5000, fs=240000, seconds=0.05)
-# t, m, f_inst, f_est, s = _test_fm_instantaneous_frequency(tone_hz=1000, dev_hz=75000, fs=240000, seconds=0.02)
+class AudioRingBuffer:
+    def __init__(self, max_samples: int):
+        self.buf = deque()
+        self.max_samples = max_samples
+        self.size = 0
+        self.lock = threading.Lock()
 
-def _test_fm_instantaneous_frequency(
-    tone_hz: float = 1_000.0,
-    dev_hz: float = 75_000.0,
-    fs: float = 240_000.0,
-    seconds: float = 0.02,
-):
-    """
-    TEST / DIDATTICA (puoi commentarla quando vuoi)
+    def push(self, x: np.ndarray):
+        if x.size == 0:
+            return
+        x = np.asarray(x, dtype=np.float32)
+        with self.lock:
+            self.buf.append(x)
+            self.size += x.size
+            while self.size > self.max_samples and self.buf:
+                old = self.buf.popleft()
+                self.size -= old.size
 
-    Genera un tono m(t)=sin(2π f_tone t) e costruisce un segnale FM IQ:
-        f_inst(t) = dev_hz * m(t)
-        phase(t)  = 2π * ∫ f_inst(t) dt
-        s(t)      = exp(j * phase(t))
-
-    Poi stima f_inst(t) dai campioni IQ con:
-        f_inst_est[n] = (fs / 2π) * angle( s[n] * conj(s[n-1]) )
-
-    Cosa devi vedere:
-    - f_inst_est oscilla tra circa -dev_hz e +dev_hz
-    - la velocità dell’oscillazione dipende da tone_hz (es. 1000 cicli/s)
-    """
-    n = int(fs * seconds)
-    t = np.arange(n) / fs
-
-    # 1) Segnale "audio" (tono puro): valori tra -1 e +1
-    m = np.sin(2 * np.pi * tone_hz * t)
-
-    # 2) FM: frequenza istantanea (in Hz) = deviazione_massima * audio
-    f_inst = dev_hz * m
-
-    # 3) Integro la frequenza per ottenere la fase (in radianti)
-    # phase[n] = 2π * sum(f_inst)/fs
-    phase = 2 * np.pi * np.cumsum(f_inst) / fs
-
-    # 4) Segnale complesso IQ (ampiezza costante, varia solo la fase)
-    s = np.exp(1j * phase).astype(np.complex64)
-
-    # 5) Stima della frequenza istantanea dal segnale IQ (discriminatore FM)
-    prod = s[1:] * np.conj(s[:-1])
-    f_inst_est = (fs / (2 * np.pi)) * np.angle(prod)  # Hz
-    f_inst_est = np.concatenate([[f_inst_est[0]], f_inst_est])  # allinea lunghezze
-
-    print("=== FM TEST ===")
-    print(f"tone_hz={tone_hz} Hz | dev_hz={dev_hz} Hz | fs={fs} Hz | seconds={seconds}")
-    print(f"Estimated f_inst min/max: {f_inst_est.min():.1f} Hz / {f_inst_est.max():.1f} Hz")
-    print("Expected approx min/max:", f"{-dev_hz:.1f} Hz / {dev_hz:.1f} Hz")
-    print("Tip: aumenta 'seconds' (es. 0.1) per osservare più cicli del tono.\n")
-
-    # Ritorno i vettori nel caso tu voglia plottarli altrove
-    return t, m, f_inst, f_inst_est, s
-
+    def pop(self, n: int) -> np.ndarray:
+        out = np.zeros(n, dtype=np.float32)
+        with self.lock:
+            i = 0
+            while i < n and self.buf:
+                chunk = self.buf[0]
+                take = min(n - i, chunk.size)
+                out[i:i+take] = chunk[:take]
+                i += take
+                if take == chunk.size:
+                    self.buf.popleft()
+                else:
+                    self.buf[0] = chunk[take:]
+                self.size -= take
+        return out
 
 
 def main():
-    # ====== Parametri ======
-    freq = 100.0e6            # cambia con una stazione forte (88-108 MHz)
-    sdr_fs = 2_048_000         # campionamento SDR
-    audio_fs = 48_000          # uscita audio
-    gain = 20                  # prova 10..35
-    rf_cut = 120_000           # LPF prima della demod (WFM ~200 kHz)
-    audio_cut = 15_000         # LPF audio mono baseband
-    block_sdr = 262144         # blocco IQ (più grande = meno drop, più latenza)
+    # ===== Parametri =====
+    freq = 100.0e6          # cambia con una stazione forte
+    sdr_fs = 240_000        # <<<<< chiave: basso e stabile
+    audio_fs = 48_000
+    decim_audio = 5         # 240k / 5 = 48k (perfetto)
+    gain = 20               # prova 10..35
 
-    # ====== SDR init ======
+    rf_cut = 100_000        # tieni quasi tutto il canale FM (~200k)
+    audio_cut = 15_000
+    tau = 50e-6             # de-emphasis EU
+
+    block_sdr = 48_000      # 0.2s di IQ a 240k (puoi aumentare a 96_000)
+    callback_frames = 1024  # frames richiesti dall'audio callback
+
+    # Ring buffer: mettiamolo più grande (10s) per assorbire jitter USB
+    ring = AudioRingBuffer(max_samples=int(audio_fs * 10.0))
+
+    # ===== SDR init =====
     sdr = RtlSdr()
     sdr.sample_rate = sdr_fs
     sdr.center_freq = freq
     sdr.gain = gain
 
-    # Filtri FIR
-    rf_lpf = design_lowpass(rf_cut, sdr_fs, numtaps=257)
-    audio_lpf = design_lowpass(audio_cut, sdr_fs, numtaps=257)
+    # Filtri (tutti a 240k o 48k)
+    rf_lpf = fir_lowpass(rf_cut, sdr_fs, numtaps=257)
+    audio_lpf_240k = fir_lowpass(audio_cut, sdr_fs, numtaps=257)
 
-    # Prepara audio stream
-    sd.default.samplerate = audio_fs
-    sd.default.channels = 1
-
-    print("START: FM live")
-    print(f"  freq={freq/1e6:.3f} MHz | sdr_fs={sdr_fs} | audio_fs={audio_fs} | gain={gain}")
-    print("  Ctrl+C per uscire")
-
-    # Stato filtri (per continuità tra blocchi)
     rf_zi = np.zeros(len(rf_lpf) - 1, dtype=np.complex64)
-    aud_zi = np.zeros(len(audio_lpf) - 1, dtype=np.float32)
+    aud_zi = np.zeros(len(audio_lpf_240k) - 1, dtype=np.float32)
+    deemp_zi = 0.0
 
-    # Stream audio
-    with sd.OutputStream(dtype='float32', samplerate=audio_fs, channels=1, blocksize=0):
+    stop = threading.Event()
+
+    def producer():
+        nonlocal rf_zi, aud_zi, deemp_zi
         try:
-            while True:
+            while not stop.is_set():
                 iq = sdr.read_samples(block_sdr).astype(np.complex64)
 
-                # RF low-pass
+                # 1) RF low-pass
                 iq_f, rf_zi = lfilter(rf_lpf, 1.0, iq, zi=rf_zi)
 
-                # FM demod
-                dem = fm_demod(iq_f).astype(np.float32)
+                # 2) FM demod (a 240k)
+                dem = fm_demod(iq_f)
 
-                # Audio low-pass
-                aud, aud_zi = lfilter(audio_lpf, 1.0, dem, zi=aud_zi)
+                # 3) Audio low-pass (a 240k)
+                aud_240k, aud_zi = lfilter(audio_lpf_240k, 1.0, dem, zi=aud_zi)
 
-                # Resample -> 48 kHz
-                # (resample_poly vuole interi: up/down)
-                aud_48k = resample_poly(aud, up=audio_fs, down=sdr_fs).astype(np.float32)
+                # 4) Decima esatta a 48k (prendo 1 campione ogni 5)
+                aud_48k = aud_240k[::decim_audio].astype(np.float32)
 
-                # De-emphasis semplice (opzionale, migliora suono FM)
-                # 75us per US, 50us per EU. Per EU usa 50e-6
-                tau = 50e-6
-                alpha = np.exp(-1.0 / (audio_fs * tau))
-                # IIR 1° ordine: y[n] = (1-alpha)*x[n] + alpha*y[n-1]
-                y = np.empty_like(aud_48k)
-                prev = 0.0
-                k = 1.0 - alpha
-                for i, x in enumerate(aud_48k):
-                    prev = k * x + alpha * prev
-                    y[i] = prev
-                aud_48k = y
+                # 5) De-emphasis (a 48k)
+                aud_48k, deemp_zi = deemphasis_iir(aud_48k, audio_fs, tau, deemp_zi)
 
-                # Normalize soft
-                aud_48k -= np.mean(aud_48k)
-                m = np.max(np.abs(aud_48k)) + 1e-9
-                aud_48k = 0.6 * (aud_48k / m)
+                # 6) Normalizzazione soft
+                aud_48k -= float(np.mean(aud_48k))
+                m = float(np.max(np.abs(aud_48k)) + 1e-9)
+                aud_48k = (0.5 / m) * aud_48k
 
-                sd.play(aud_48k, samplerate=audio_fs, blocking=True)
+                ring.push(aud_48k)
 
-        except KeyboardInterrupt:
-            print("\nSTOP")
-        finally:
+        except Exception as e:
+            print("Producer error:", repr(e))
+            stop.set()
+
+    t = threading.Thread(target=producer, daemon=True)
+    t.start()
+
+    def callback(outdata, frames, time_info, status):
+        # se ring è vuoto, esce silenzio (niente scatto “burst”)
+        outdata[:, 0] = ring.pop(frames)
+
+    print("START WFM (240k->48k) — Ctrl+C per uscire")
+    print(f"freq={freq/1e6:.3f} MHz | sdr_fs={sdr_fs} | gain={gain}")
+
+    try:
+        with sd.OutputStream(
+            samplerate=audio_fs,
+            channels=1,
+            dtype="float32",
+            callback=callback,
+            blocksize=callback_frames,
+            latency="high",
+        ):
+            while not stop.is_set():
+                time.sleep(0.2)
+
+    except KeyboardInterrupt:
+        print("\nSTOP")
+    finally:
+        stop.set()
+        try:
             sdr.close()
+        except Exception:
+            pass
+
 
 if __name__ == "__main__":
     main()
