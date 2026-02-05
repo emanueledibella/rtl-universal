@@ -37,10 +37,12 @@
 
 // ------------ globals / state ------------
 static volatile int g_stop = 0;
+static rtlsdr_dev_t* g_dev = NULL;
 
 static void on_sigint(int sig) {
     (void)sig;
     g_stop = 1;
+    if (g_dev) rtlsdr_cancel_async(g_dev);
 }
 
 // Simple ring buffer for float mono audio
@@ -256,6 +258,7 @@ int main(int argc, char** argv) {
         fprintf(stderr, "rtlsdr_open failed\n");
         return 1;
     }
+    g_dev = dev;
 
     // Set sample rate + center frequency
     rtlsdr_set_sample_rate(dev, SDR_FS);
@@ -282,6 +285,7 @@ int main(int argc, char** argv) {
     PaError pe = Pa_Initialize();
     if (pe != paNoError) {
         fprintf(stderr, "Pa_Initialize error: %s\n", Pa_GetErrorText(pe));
+        g_dev = NULL;
         rtlsdr_close(dev);
         return 1;
     }
@@ -298,6 +302,7 @@ int main(int argc, char** argv) {
     if (pe != paNoError) {
         fprintf(stderr, "Pa_OpenDefaultStream error: %s\n", Pa_GetErrorText(pe));
         Pa_Terminate();
+        g_dev = NULL;
         rtlsdr_close(dev);
         return 1;
     }
@@ -307,6 +312,7 @@ int main(int argc, char** argv) {
         fprintf(stderr, "Pa_StartStream error: %s\n", Pa_GetErrorText(pe));
         Pa_CloseStream(stream);
         Pa_Terminate();
+        g_dev = NULL;
         rtlsdr_close(dev);
         return 1;
     }
@@ -322,6 +328,7 @@ int main(int argc, char** argv) {
     Pa_CloseStream(stream);
     Pa_Terminate();
 
+    g_dev = NULL;
     rtlsdr_close(dev);
 
     if (r < 0) {
