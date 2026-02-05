@@ -31,9 +31,9 @@
 
 #define SDR_FS        2400000   // 2.4 MS/s
 #define FS1           240000    // after decim1=10
-#define AUDIO_FS      48000     // after decim2=5
-#define DECIM1        10
-#define DECIM2        5
+#define AUDIO_FS      240000     // after decim2=5
+#define DECIM1        5
+#define DECIM2        2
 
 // ring buffer seconds (audio)
 #define RING_SECONDS  4
@@ -350,10 +350,7 @@ int main(int argc, char** argv) {
             decoder_name = argv[++i];
             continue;
         }
-        if (strcmp(arg, "--ais-test") == 0) {
-            ais_test = 1;
-            continue;
-        }
+      
         if (streq_icase(arg, "voice") || streq_icase(arg, "voce") || streq_icase(arg, "ais")) {
             decoder_name = arg;
             continue;
@@ -388,15 +385,6 @@ int main(int argc, char** argv) {
     memset(&g_ring, 0, sizeof(g_ring));
     memset(&g_dsp, 0, sizeof(g_dsp));
     if (g_decoder->init) g_decoder->init(AUDIO_FS);
-
-    if (ais_test) {
-        if (streq_icase(g_decoder->name, "ais")) {
-            ais_test_emit_example();
-            return 0;
-        }
-        fprintf(stderr, "--ais-test works only with mode=ais\n");
-        return 1;
-    }
 
     // ---- init RTL-SDR ----
     rtlsdr_dev_t* dev = NULL;
