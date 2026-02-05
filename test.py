@@ -11,6 +11,66 @@ def fm_demod(iq: np.ndarray) -> np.ndarray:
     prod = iq[1:] * np.conj(iq[:-1])
     return np.angle(prod)
 
+import numpy as np
+
+
+# ESEMPIO USO (commenta quando non ti serve):
+# t, m, f_inst, f_est, s = _test_fm_instantaneous_frequency(tone_hz=1000, dev_hz=5000, fs=240000, seconds=0.05)
+# t, m, f_inst, f_est, s = _test_fm_instantaneous_frequency(tone_hz=1000, dev_hz=75000, fs=240000, seconds=0.02)
+
+def _test_fm_instantaneous_frequency(
+    tone_hz: float = 1_000.0,
+    dev_hz: float = 75_000.0,
+    fs: float = 240_000.0,
+    seconds: float = 0.02,
+):
+    """
+    TEST / DIDATTICA (puoi commentarla quando vuoi)
+
+    Genera un tono m(t)=sin(2π f_tone t) e costruisce un segnale FM IQ:
+        f_inst(t) = dev_hz * m(t)
+        phase(t)  = 2π * ∫ f_inst(t) dt
+        s(t)      = exp(j * phase(t))
+
+    Poi stima f_inst(t) dai campioni IQ con:
+        f_inst_est[n] = (fs / 2π) * angle( s[n] * conj(s[n-1]) )
+
+    Cosa devi vedere:
+    - f_inst_est oscilla tra circa -dev_hz e +dev_hz
+    - la velocità dell’oscillazione dipende da tone_hz (es. 1000 cicli/s)
+    """
+    n = int(fs * seconds)
+    t = np.arange(n) / fs
+
+    # 1) Segnale "audio" (tono puro): valori tra -1 e +1
+    m = np.sin(2 * np.pi * tone_hz * t)
+
+    # 2) FM: frequenza istantanea (in Hz) = deviazione_massima * audio
+    f_inst = dev_hz * m
+
+    # 3) Integro la frequenza per ottenere la fase (in radianti)
+    # phase[n] = 2π * sum(f_inst)/fs
+    phase = 2 * np.pi * np.cumsum(f_inst) / fs
+
+    # 4) Segnale complesso IQ (ampiezza costante, varia solo la fase)
+    s = np.exp(1j * phase).astype(np.complex64)
+
+    # 5) Stima della frequenza istantanea dal segnale IQ (discriminatore FM)
+    prod = s[1:] * np.conj(s[:-1])
+    f_inst_est = (fs / (2 * np.pi)) * np.angle(prod)  # Hz
+    f_inst_est = np.concatenate([[f_inst_est[0]], f_inst_est])  # allinea lunghezze
+
+    print("=== FM TEST ===")
+    print(f"tone_hz={tone_hz} Hz | dev_hz={dev_hz} Hz | fs={fs} Hz | seconds={seconds}")
+    print(f"Estimated f_inst min/max: {f_inst_est.min():.1f} Hz / {f_inst_est.max():.1f} Hz")
+    print("Expected approx min/max:", f"{-dev_hz:.1f} Hz / {dev_hz:.1f} Hz")
+    print("Tip: aumenta 'seconds' (es. 0.1) per osservare più cicli del tono.\n")
+
+    # Ritorno i vettori nel caso tu voglia plottarli altrove
+    return t, m, f_inst, f_inst_est, s
+
+
+
 def main():
     # ====== Parametri ======
     freq = 100.0e6            # cambia con una stazione forte (88-108 MHz)
