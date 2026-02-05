@@ -88,6 +88,26 @@ static void ais_parse_and_print(const uint8_t *info, size_t info_len) {
     }
 }
 
+static void set_bits_stream(uint8_t *bytes, int start_bit, int bit_len, uint32_t value) {
+    // write MSB-first value into LSB-first bitstream
+    for (int i = 0; i < bit_len; i++) {
+        int bit_index = start_bit + i;
+        int byte_i = bit_index / 8;
+        int bit_i  = bit_index % 8;
+        int bit = (value >> (bit_len - 1 - i)) & 1;
+        if (bit) {
+            bytes[byte_i] |= (uint8_t)(1u << bit_i);
+        } else {
+            bytes[byte_i] &= (uint8_t)~(1u << bit_i);
+        }
+    }
+}
+
+static uint32_t encode_signed(int32_t v, int bits) {
+    if (v >= 0) return (uint32_t)v;
+    return (uint32_t)((1u << bits) + v);
+}
+
 // ---- Frame handling ----
 static void hdlc_end_frame(ais_ctx_t *ctx) {
     // flush last partial byte? (in HDLC normalmente byte allineati, ma per sicurezza)
@@ -204,4 +224,30 @@ void ais_feed_samples(ais_ctx_t *ctx, const float *samples, size_t n) {
 // Tu la puoi sostituire in un altro file, oppure cambiare questa.
 void ais_on_frame(const uint8_t *frame, size_t len) {
     printf("[AIS] frame len=%zu bytes\n", len);
+}
+
+void ais_test_emit_example(void) {
+    // Example AIS type 1 (position report) payload, minimal fields set.
+    uint8_t info[21];
+    memset(info, 0, sizeof(info));
+
+    // type=1, repeat=0, mmsi=247320162
+    set_bits_stream(info, 0, 6, 1);
+    set_bits_stream(info, 6, 2, 0);
+    set_bits_stream(info, 8, 30, 247320162u);
+
+    // SOG = 12.0 kn (value *10)
+    set_bits_stream(info, 50, 10, 120u);
+
+    // Lon/Lat (1/10000 minute = 1/600000 degree), two's complement
+    double lon = -122.4194;
+    double lat = 37.7749;
+    int32_t lon_raw = (int32_t)lrint(lon * 600000.0);
+    int32_t lat_raw = (int32_t)lrint(lat * 600000.0);
+    set_bits_stream(info, 61, 28, encode_signed(lon_raw, 28));
+    set_bits_stream(info, 89, 27, encode_signed(lat_raw, 27));
+
+    printf("[AIS] test frame (synthetic)\n");
+    ais_on_frame(info, sizeof(info));
+    ais_parse_and_print(info, sizeof(info));
 }

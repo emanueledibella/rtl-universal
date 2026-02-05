@@ -8,6 +8,7 @@
 // Optional gain (dB) and mode:
 //   ./wfm_live 100.0 20 voice
 //   ./wfm_live 162.0 --mode ais
+//   ./wfm_live 162.0 --mode ais --ais-test
 //
 // Notes:
 // - Uses async read (stable like rtl_fm).
@@ -311,6 +312,7 @@ static void ais_flush(void) {
 static void usage(const char* prog) {
     fprintf(stderr, "Usage: %s <freq_mhz> [gain_db] [mode]\n", prog);
     fprintf(stderr, "       %s <freq_mhz> [gain_db] --mode <voice|ais>\n", prog);
+    fprintf(stderr, "       %s <freq_mhz> --mode ais --ais-test\n", prog);
     fprintf(stderr, "Example: %s 100.0 20 voice\n", prog);
     fprintf(stderr, "         %s 162.0 --mode ais\n", prog);
 }
@@ -335,6 +337,7 @@ int main(int argc, char** argv) {
     const char* decoder_name = "voice";
     int gain = 0;
     int use_manual_gain = 0;
+    int ais_test = 0;
 
     for (int i = 2; i < argc; i++) {
         const char* arg = argv[i];
@@ -345,6 +348,10 @@ int main(int argc, char** argv) {
                 return 1;
             }
             decoder_name = argv[++i];
+            continue;
+        }
+        if (strcmp(arg, "--ais-test") == 0) {
+            ais_test = 1;
             continue;
         }
         if (streq_icase(arg, "voice") || streq_icase(arg, "voce") || streq_icase(arg, "ais")) {
@@ -381,6 +388,15 @@ int main(int argc, char** argv) {
     memset(&g_ring, 0, sizeof(g_ring));
     memset(&g_dsp, 0, sizeof(g_dsp));
     if (g_decoder->init) g_decoder->init(AUDIO_FS);
+
+    if (ais_test) {
+        if (streq_icase(g_decoder->name, "ais")) {
+            ais_test_emit_example();
+            return 0;
+        }
+        fprintf(stderr, "--ais-test works only with mode=ais\n");
+        return 1;
+    }
 
     // ---- init RTL-SDR ----
     rtlsdr_dev_t* dev = NULL;

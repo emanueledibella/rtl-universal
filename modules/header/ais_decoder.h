@@ -42,6 +42,9 @@ void ais_feed_samples(ais_ctx_t *ctx, const float *samples, size_t n);
 // puoi sostituirla con la tua logica (stampa, JSON, ecc.)
 void ais_on_frame(const uint8_t *frame, size_t len);
 
+// test helper: emette un frame AIS sintetico (bypassa la parte RF/HDLC)
+void ais_test_emit_example(void);
+
 #ifdef __cplusplus
 }
 #endif
