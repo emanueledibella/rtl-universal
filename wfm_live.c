@@ -222,13 +222,15 @@ static void usage(const char* prog) {
 
 int main(int argc, char** argv) {
     signal(SIGINT, on_sigint);
+    char* freq_opt = argv[1];
+    char* gain_opt = argv[2];
 
     if (argc < 2) {
         usage(argv[0]);
         return 1;
     }
 
-    double freq_mhz = atof(argv[1]);
+    double freq_mhz = atof(freq_opt);
     if (freq_mhz < 10.0) {
         fprintf(stderr, "Invalid frequency.\n");
         return 1;
@@ -238,7 +240,7 @@ int main(int argc, char** argv) {
     int gain = 0; // 0 means auto in librtlsdr API? We'll set manual if provided
     int use_manual_gain = 0;
     if (argc >= 3) {
-        gain = atoi(argv[2]);
+        gain = atoi(gain_opt);
         use_manual_gain = 1;
     }
 
@@ -278,7 +280,7 @@ int main(int argc, char** argv) {
 
     printf("START WFM C (async)\n");
     printf("  freq=%.3f MHz | sdr_fs=%d | audio_fs=%d | gain=%s\n",
-           freq_mhz, SDR_FS, AUDIO_FS, use_manual_gain ? argv[2] : "auto");
+           freq_mhz, SDR_FS, AUDIO_FS, use_manual_gain ? gain_opt : "auto");
     printf("  Ctrl+C to stop\n");
 
     // ---- init PortAudio ----
