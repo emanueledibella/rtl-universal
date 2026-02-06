@@ -1,7 +1,7 @@
 // wfm_live.c
 // Minimal WFM (FM broadcast) mono receiver: RTL-SDR -> FM demod -> PortAudio
 // Build (Homebrew):
-//   cc -O2 -std=c11 wfm_live.c modules/ais_decoder.c -o wfm_live $(pkg-config --cflags --libs librtlsdr portaudio-2.0) -lm
+//   cc -O2 -std=c11 wfm_live.c modules/ais_decoder.c modules/voice_decoder.c -o wfm_live $(pkg-config --cflags --libs librtlsdr portaudio-2.0) -lm
 //
 // Run:
 //   ./wfm_live 100.0   (MHz)             [voice default]
@@ -28,9 +28,9 @@
 #include <rtl-sdr.h>
 #include <portaudio.h>
 #include "modules/header/ais_decoder.h"
+#include "modules/header/voice_decoder.h"
 
 #define SDR_FS        2400000   // 2.4 MS/s
-#define FS1           240000    // after decim1=10
 #define AUDIO_FS      240000     // after decim2=5
 #define DECIM1        5
 #define DECIM2        2
@@ -45,6 +45,9 @@ static rtlsdr_dev_t* g_dev = NULL;
 
 // AIS
 static ais_ctx_t g_ais;
+
+// Voice
+static voice_ctx_t g_voice;
 
 
 static void on_sigint(int sig) {
@@ -104,31 +107,6 @@ static inline float fm_discriminator(float i, float q, float i_prev, float q_pre
     return atan2f(im, re);
 }
 
-// 1-pole de-emphasis filter y[n] = (1-a)*x[n] + a*y[n-1]
-typedef struct {
-    float a;
-    float y1;
-} deemph_t;
-
-static deemph_t g_deemph;
-
-static inline float deemph_process(deemph_t* d, float x) {
-    float y = (1.0f - d->a) * x + d->a * d->y1;
-    d->y1 = y;
-    return y;
-}
-
-// Normalize block softly
-static void normalize_block(float* x, uint32_t n, float target) {
-    float m = 1e-9f;
-    for (uint32_t i = 0; i < n; i++) {
-        float a = fabsf(x[i]);
-        if (a > m) m = a;
-    }
-    float k = target / m;
-    for (uint32_t i = 0; i < n; i++) x[i] *= k;
-}
-
 // --------- PortAudio callback ----------
 static int pa_cb(const void* input, void* output,
                  unsigned long frameCount,
@@ -157,10 +135,6 @@ typedef struct {
     float q_prev;
     int have_prev;
 
-    // Small temp audio buffer
-    float audio_tmp[4096];
-    uint32_t audio_tmp_len;
-
     // Small temp AIS buffer (raw demod @ 48k)
     float ais_tmp[4096];
     uint32_t ais_tmp_len;
@@ -178,16 +152,16 @@ typedef struct {
     void (*flush)(void);
 } decoder_ops_t;
 
-static void voice_init(int fs_demod);
-static void voice_process_sample(float sample);
-static void voice_flush(void);
+static void voice_init_decoder(int fs_demod);
+static void voice_process_sample_decoder(float sample);
+static void voice_flush_decoder(void);
 static void ais_init_decoder(int fs_demod);
 static void ais_process_sample(float sample);
 static void ais_flush(void);
 
 // Add new decoders here.
 static const decoder_ops_t g_decoders[] = {
-    { "voice", 1, voice_init, voice_process_sample, voice_flush },
+    { "voice", 1, voice_init_decoder, voice_process_sample_decoder, voice_flush_decoder },
     { "ais",   0, ais_init_decoder, ais_process_sample, ais_flush },
     { NULL,    0, NULL, NULL, NULL }
 };
@@ -257,37 +231,21 @@ static void rtlsdr_cb(unsigned char* buf, uint32_t len, void* ctx) {
 }
 
 // --------- Decoder implementations ----------
-static void voice_flush_block(void) {
-    if (g_dsp.audio_tmp_len == 0) return;
-
-    // Remove DC and normalize lightly
-    float mean = 0.0f;
-    for (uint32_t k = 0; k < g_dsp.audio_tmp_len; k++) mean += g_dsp.audio_tmp[k];
-    mean /= (float)g_dsp.audio_tmp_len;
-    for (uint32_t k = 0; k < g_dsp.audio_tmp_len; k++) g_dsp.audio_tmp[k] -= mean;
-
-    normalize_block(g_dsp.audio_tmp, g_dsp.audio_tmp_len, 0.5f);
-    ring_push(g_dsp.audio_tmp, g_dsp.audio_tmp_len);
-    g_dsp.audio_tmp_len = 0;
+static void voice_ring_output(void* user, const float* samples, uint32_t n) {
+    (void)user;
+    ring_push(samples, n);
 }
 
-static void voice_init(int fs_demod) {
-    const float tau = 50e-6f;
-    g_deemph.a = expf(-1.0f / ((float)fs_demod * tau));
-    g_deemph.y1 = 0.0f;
-    g_dsp.audio_tmp_len = 0;
+static void voice_init_decoder(int fs_demod) {
+    voice_decoder_init(&g_voice, fs_demod, voice_ring_output, NULL);
 }
 
-static void voice_process_sample(float sample) {
-    float a = deemph_process(&g_deemph, sample);
-    g_dsp.audio_tmp[g_dsp.audio_tmp_len++] = a;
-    if (g_dsp.audio_tmp_len >= 2048) {
-        voice_flush_block();
-    }
+static void voice_process_sample_decoder(float sample) {
+    voice_decoder_process_sample(&g_voice, sample);
 }
 
-static void voice_flush(void) {
-    voice_flush_block();
+static void voice_flush_decoder(void) {
+    voice_decoder_flush(&g_voice);
 }
 
 static void ais_init_decoder(int fs_demod) {
