@@ -12,6 +12,8 @@ typedef struct {
     int phase;            // 0..samp_per_bit-1
     float lp;             // piccolo filtro IIR
     float lp_alpha;       // 0..1
+    float dc;             // DC blocker state
+    float dc_alpha;       // 0..1
 
     // --- HDLC/AIS state ---
     uint32_t shift_reg;   // per cercare 0x7E
@@ -23,6 +25,7 @@ typedef struct {
 
     // NRZI decode
     int last_nrzi;
+    int have_last_nrzi;
 
     // frame buffer (byte-wise, LSB-first bits)
     uint8_t buf[1024];

@@ -271,6 +271,9 @@ static void usage(const char* prog) {
     fprintf(stderr, "Usage: %s <freq_mhz> [gain_db] [mode]\n", prog);
     fprintf(stderr, "       %s <freq_mhz> [gain_db] --mode <voice|ais>\n", prog);
     fprintf(stderr, "       %s <freq_mhz> --mode ais --ais-test\n", prog);
+    fprintf(stderr, "Options:\n");
+    fprintf(stderr, "  --ppm <int>   frequency correction (e.g. -20, +35)\n");
+    fprintf(stderr, "  --bw  <hz>    tuner bandwidth (Hz), 0=auto\n");
     fprintf(stderr, "Example: %s 100.0 20 voice\n", prog);
     fprintf(stderr, "         %s 162.0 --mode ais\n", prog);
 }
@@ -296,6 +299,9 @@ int main(int argc, char** argv) {
     int gain = 0;
     int use_manual_gain = 0;
     int ais_test = 0;
+    int ppm = 0;
+    int have_ppm = 0;
+    uint32_t tuner_bw = 0;
 
     for (int i = 2; i < argc; i++) {
         const char* arg = argv[i];
@@ -306,6 +312,39 @@ int main(int argc, char** argv) {
                 return 1;
             }
             decoder_name = argv[++i];
+            continue;
+        }
+        if (strcmp(arg, "--ais-test") == 0) {
+            ais_test = 1;
+            continue;
+        }
+        if (strcmp(arg, "--ppm") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Missing value for %s\n", arg);
+                usage(argv[0]);
+                return 1;
+            }
+            int parsed_ppm = 0;
+            if (!parse_int_arg(argv[++i], &parsed_ppm)) {
+                fprintf(stderr, "Invalid value for --ppm\n");
+                return 1;
+            }
+            ppm = parsed_ppm;
+            have_ppm = 1;
+            continue;
+        }
+        if (strcmp(arg, "--bw") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Missing value for %s\n", arg);
+                usage(argv[0]);
+                return 1;
+            }
+            int parsed_bw = 0;
+            if (!parse_int_arg(argv[++i], &parsed_bw) || parsed_bw < 0) {
+                fprintf(stderr, "Invalid value for --bw\n");
+                return 1;
+            }
+            tuner_bw = (uint32_t)parsed_bw;
             continue;
         }
       
@@ -344,6 +383,15 @@ int main(int argc, char** argv) {
     memset(&g_dsp, 0, sizeof(g_dsp));
     if (g_decoder->init) g_decoder->init(AUDIO_FS);
 
+    if (ais_test) {
+        if (streq_icase(g_decoder->name, "ais")) {
+            ais_test_emit_example();
+            return 0;
+        }
+        fprintf(stderr, "--ais-test works only with mode=ais\n");
+        return 1;
+    }
+
     // ---- init RTL-SDR ----
     rtlsdr_dev_t* dev = NULL;
     int r = rtlsdr_open(&dev, 0);
@@ -353,9 +401,36 @@ int main(int argc, char** argv) {
     }
     g_dev = dev;
 
+    if (have_ppm) {
+        r = rtlsdr_set_freq_correction(dev, ppm);
+        if (r < 0) {
+            fprintf(stderr, "Warning: rtlsdr_set_freq_correction failed (%d)\n", r);
+        }
+    }
+
     // Set sample rate + center frequency
-    rtlsdr_set_sample_rate(dev, SDR_FS);
-    rtlsdr_set_center_freq(dev, freq_hz);
+    r = rtlsdr_set_sample_rate(dev, SDR_FS);
+    if (r < 0) {
+        fprintf(stderr, "rtlsdr_set_sample_rate failed (%d)\n", r);
+        g_dev = NULL;
+        rtlsdr_close(dev);
+        return 1;
+    }
+
+    if (tuner_bw > 0) {
+        r = rtlsdr_set_tuner_bandwidth(dev, tuner_bw);
+        if (r < 0) {
+            fprintf(stderr, "Warning: rtlsdr_set_tuner_bandwidth failed (%d)\n", r);
+        }
+    }
+
+    r = rtlsdr_set_center_freq(dev, freq_hz);
+    if (r < 0) {
+        fprintf(stderr, "rtlsdr_set_center_freq failed (%d)\n", r);
+        g_dev = NULL;
+        rtlsdr_close(dev);
+        return 1;
+    }
 
     // Gain
     if (use_manual_gain) {
@@ -377,8 +452,11 @@ int main(int argc, char** argv) {
     }
 
     printf("START WFM C (async)\n");
-    printf("  freq=%.3f MHz | sdr_fs=%d | audio_fs=%d | gain=%s | mode=%s\n",
+    printf("  freq=%.3f MHz | sdr_fs=%d | audio_fs=%d | gain=%s | mode=%s",
            freq_mhz, SDR_FS, AUDIO_FS, gain_desc, g_decoder->name);
+    if (have_ppm) printf(" | ppm=%d", ppm);
+    if (tuner_bw) printf(" | bw=%u", tuner_bw);
+    printf("\n");
     printf("  Ctrl+C to stop\n");
 
     PaStream* stream = NULL;

@@ -136,8 +136,20 @@ static void hdlc_end_frame(ais_ctx_t *ctx) {
 }
 
 static void hdlc_push_bit(ais_ctx_t *ctx, int bit) {
+    // AIS usa NRZI: raw level 0/1 dal demod (slicer). Prima facciamo NRZI decode,
+    // poi HDLC (flag detection + destuffing) sul bitstream decodificato.
+    int raw = bit & 1;
+    if (!ctx->have_last_nrzi) {
+        ctx->last_nrzi = raw;
+        ctx->have_last_nrzi = 1;
+        return;
+    }
+
+    int decoded = (raw == ctx->last_nrzi) ? 1 : 0;
+    ctx->last_nrzi = raw;
+
     // shift register per flag detection (LSB-first)
-    ctx->shift_reg = ((ctx->shift_reg << 1) | (uint32_t)(bit & 1)) & 0xFF;
+    ctx->shift_reg = ((ctx->shift_reg << 1) | (uint32_t)(decoded & 1)) & 0xFF;
 
     if (is_flag_0x7E((uint8_t)ctx->shift_reg)) {
         if (ctx->in_frame) {
@@ -148,7 +160,6 @@ static void hdlc_push_bit(ais_ctx_t *ctx, int bit) {
         ctx->in_frame = 1;
         ctx->ones_count = 0;
         ctx->skip_next_zero = 0;
-        ctx->last_nrzi = 0; // reset NRZI state
         buf_reset(ctx);
         return;
     }
@@ -157,16 +168,15 @@ static void hdlc_push_bit(ais_ctx_t *ctx, int bit) {
 
     // --- bit destuffing (HDLC): dopo 5 '1' consecutivi, lo zero successivo è stuffing ---
     if (ctx->skip_next_zero) {
-        // questo bit dovrebbe essere zero stuffing: scartalo
         ctx->skip_next_zero = 0;
-        if (bit == 0) return; // ok, stuffed
+        if (decoded == 0) return; // stuffed, discard
         // se non è zero, frame corrotto: reset
         ctx->in_frame = 0;
         buf_reset(ctx);
         return;
     }
 
-    if (bit == 1) {
+    if (decoded == 1) {
         ctx->ones_count++;
         if (ctx->ones_count == 5) {
             ctx->skip_next_zero = 1;
@@ -174,15 +184,6 @@ static void hdlc_push_bit(ais_ctx_t *ctx, int bit) {
     } else {
         ctx->ones_count = 0;
     }
-
-    // AIS usa NRZI: bit 0 = transizione, bit 1 = nessuna transizione (convenzione comune)
-    // Qui implementiamo NRZI decode su livello logico "bit" già estratto:
-    // Serve un livello NRZI, ma noi abbiamo già un bit "raw" dal slicer: per semplicità,
-    // assumiamo che il slicer produca NRZI-level (0/1) e facciamo differential decode:
-    // decoded = (raw == last_raw) ? 1 : 0
-    int raw = bit;
-    int decoded = (raw == ctx->last_nrzi) ? 1 : 0;
-    ctx->last_nrzi = raw;
 
     // aggiungi bit al buffer
     buf_push_bit_lsb(ctx, decoded);
@@ -195,6 +196,11 @@ void ais_init(ais_ctx_t *ctx, int fs_demod) {
     ctx->phase = ctx->samp_per_bit / 2;
     ctx->lp = 0.0f;
     ctx->lp_alpha = 0.2f; // smoothing leggero
+
+    // DC blocker time constant (seconds) to remove discriminator offset due to tuning/ppm.
+    const float tau_dc = 0.05f;
+    ctx->dc = 0.0f;
+    ctx->dc_alpha = 1.0f - expf(-1.0f / ((float)fs_demod * tau_dc));
 }
 
 static int slice_bit_from_sample(float x) {
@@ -208,10 +214,13 @@ void ais_feed_samples(ais_ctx_t *ctx, const float *samples, size_t n) {
 
         // piccolo lowpass IIR per stabilizzare
         ctx->lp = ctx->lp + ctx->lp_alpha * (s - ctx->lp);
+        // rimuovi offset DC lento (es. frequenza non centrata)
+        ctx->dc = ctx->dc + ctx->dc_alpha * (ctx->lp - ctx->dc);
+        float bb = ctx->lp - ctx->dc;
 
         // clock: ogni samp_per_bit campioni, prendi un bit
         if (ctx->phase == 0) {
-            int bit = slice_bit_from_sample(ctx->lp);
+            int bit = slice_bit_from_sample(bb);
             hdlc_push_bit(ctx, bit);
             ctx->phase = ctx->samp_per_bit - 1;
         } else {
