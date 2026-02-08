@@ -8,6 +8,16 @@ cc -O2 -std=c11 wfm_live.c modules/ais_decoder.c modules/voice_decoder.c -o wfm_
 #Examples
 ./wfm_live 100.0 20 voice
 ./wfm_live 162.0 --mode ais
-
 ./wfm_live 162.0 --mode ais --ais-test
 ./wfm_live 162.025 40 --mode ais --ppm 20 --bw 200000
+
+# AIS quick start
+# AIS1: 161.975 MHz, AIS2: 162.025 MHz
+./wfm_live 161.975 --mode ais
+./wfm_live 162.025 --mode ais
+# Optional tuner bandwidth and ppm correction
+./wfm_live 162.025 --mode ais --bw 25000 --ppm -20
+
+
+brew install librtlsdr portaudio liquid-dsp pkg-config
+export PKG_CONFIG_PATH="$(brew --prefix)/lib/pkgconfig:$(brew --prefix)/share/pkgconfig"

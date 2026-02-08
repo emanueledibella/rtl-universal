@@ -2,6 +2,8 @@
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
+#include <stdlib.h>
+#include <complex.h>
 
 // ---- CRC-16 (HDLC/PPP style, reflected 0x1021 -> 0x8408) ----
 static uint16_t crc16_hdlc(const uint8_t *data, size_t len) {
@@ -191,42 +193,53 @@ static void hdlc_push_bit(ais_ctx_t *ctx, int bit) {
 
 void ais_init(ais_ctx_t *ctx, int fs_demod) {
     memset(ctx, 0, sizeof(*ctx));
-    ctx->samp_per_bit = fs_demod / 9600;  // se fs_demod=48000 => 5
-    if (ctx->samp_per_bit < 2) ctx->samp_per_bit = 2;
-    ctx->phase = ctx->samp_per_bit / 2;
-    ctx->lp = 0.0f;
-    ctx->lp_alpha = 0.2f; // smoothing leggero
-
-    // DC blocker time constant (seconds) to remove discriminator offset due to tuning/ppm.
-    const float tau_dc = 0.05f;
-    ctx->dc = 0.0f;
-    ctx->dc_alpha = 1.0f - expf(-1.0f / ((float)fs_demod * tau_dc));
-}
-
-static int slice_bit_from_sample(float x) {
-    return (x >= 0.0f) ? 1 : 0;
-}
-
-void ais_feed_samples(ais_ctx_t *ctx, const float *samples, size_t n) {
-    // Slicer semplice: filtra un po' e campiona 1 bit ogni samp_per_bit
-    for (size_t i = 0; i < n; i++) {
-        float s = samples[i];
-
-        // piccolo lowpass IIR per stabilizzare
-        ctx->lp = ctx->lp + ctx->lp_alpha * (s - ctx->lp);
-        // rimuovi offset DC lento (es. frequenza non centrata)
-        ctx->dc = ctx->dc + ctx->dc_alpha * (ctx->lp - ctx->dc);
-        float bb = ctx->lp - ctx->dc;
-
-        // clock: ogni samp_per_bit campioni, prendi un bit
-        if (ctx->phase == 0) {
-            int bit = slice_bit_from_sample(bb);
-            hdlc_push_bit(ctx, bit);
-            ctx->phase = ctx->samp_per_bit - 1;
-        } else {
-            ctx->phase--;
-        }
+    ctx->k = (unsigned int)(fs_demod / 9600);
+    if (ctx->k < 2) ctx->k = 2;
+    if ((fs_demod % 9600) != 0) {
+        fprintf(stderr, "[AIS] warning: fs_demod=%d not multiple of 9600, k=%u\n",
+                fs_demod, ctx->k);
     }
+
+    ctx->m = 3;
+    ctx->bt = 0.4f;
+    ctx->demod = gmskdem_create(ctx->k, ctx->m, ctx->bt);
+    if (!ctx->demod) {
+        fprintf(stderr, "[AIS] gmskdem_create failed\n");
+        return;
+    }
+
+    ctx->sym_buf = (liquid_float_complex*)calloc(ctx->k, sizeof(liquid_float_complex));
+    if (!ctx->sym_buf) {
+        fprintf(stderr, "[AIS] sym_buf alloc failed\n");
+        gmskdem_destroy(ctx->demod);
+        ctx->demod = NULL;
+        return;
+    }
+    ctx->sym_idx = 0;
+}
+
+void ais_process_sample_iq(ais_ctx_t *ctx, float i, float q) {
+    if (!ctx || !ctx->demod || !ctx->sym_buf) return;
+    ctx->sym_buf[ctx->sym_idx++] = i + _Complex_I * q;
+    if (ctx->sym_idx >= ctx->k) {
+        unsigned int sym = 0;
+        gmskdem_demodulate(ctx->demod, ctx->sym_buf, &sym);
+        hdlc_push_bit(ctx, (int)(sym & 1u));
+        ctx->sym_idx = 0;
+    }
+}
+
+void ais_flush(ais_ctx_t *ctx) {
+    if (!ctx) return;
+    if (ctx->demod) {
+        gmskdem_destroy(ctx->demod);
+        ctx->demod = NULL;
+    }
+    if (ctx->sym_buf) {
+        free(ctx->sym_buf);
+        ctx->sym_buf = NULL;
+    }
+    ctx->sym_idx = 0;
 }
 
 // Default callback: stampa solo lunghezza frame.

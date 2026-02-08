@@ -1,7 +1,9 @@
 // wfm_live.c
 // Minimal WFM (FM broadcast) mono receiver: RTL-SDR -> FM demod -> PortAudio
 // Build (Homebrew):
-//   cc -O2 -std=c11 wfm_live.c modules/ais_decoder.c modules/voice_decoder.c -o wfm_live $(pkg-config --cflags --libs librtlsdr portaudio-2.0) -lm
+//   cc -O2 -std=c11 wfm_live.c modules/ais_decoder.c modules/voice_decoder.c -o wfm_live \
+//     $(pkg-config --cflags --libs librtlsdr portaudio-2.0 liquid) -lm
+//   (se pkg-config non trova "liquid", prova "liquid-dsp")
 //
 // Run:
 //   ./wfm_live 100.0   (MHz)             [voice default]
@@ -12,9 +14,9 @@
 //
 // Notes:
 // - Uses async read (stable like rtl_fm).
-// - Downsamples 2.4 MS/s -> 240 kS/s (decim=10) using simple boxcar averaging.
-// - Then 240 kS/s -> 48 kS/s (decim=5) also boxcar.
-// - FM demod via phase difference angle(IQ[n]*conj(IQ[n-1])).
+// - Downsamples 2.4 MS/s -> 480 kS/s (decim=5) using simple boxcar averaging.
+// - Voice: FM demod at 480 kS/s, then 480 -> 240 kS/s (decim=2).
+// - AIS: complex downsample 480 -> 96 kS/s (decim=5), then GMSK demod.
 // - De-emphasis 50us (EU) 1-pole IIR.
 
 #include <stdio.h>
@@ -31,13 +33,15 @@
 #include "modules/header/voice_decoder.h"
 
 #define SDR_FS        2400000   // 2.4 MS/s
-#define AUDIO_FS      240000     // after decim2=5
-#define DECIM1        5
-#define DECIM2        2
+#define VOICE_FS      240000    // voice demod output (after DECIM2)
+#define AIS_FS        96000     // AIS complex sample rate for GMSK demod
+#define DECIM1        5         // 2.4M -> 480k
+#define DECIM2        2         // 480k -> 240k (voice)
+#define DECIM_AIS     5         // 480k -> 96k (AIS)
 
 // ring buffer seconds (audio)
 #define RING_SECONDS  4
-#define RING_SIZE     (AUDIO_FS * RING_SECONDS)
+#define RING_SIZE     (VOICE_FS * RING_SECONDS)
 
 // ------------ globals / state ------------
 static volatile int g_stop = 0;
@@ -126,19 +130,20 @@ typedef struct {
     int32_t acc1_i;
     int32_t acc1_q;
 
-    // Decim2 accumulators (audio stage)
+    // Decim2 accumulators (voice stage)
     int acc2_count;
     float acc2;
+
+    // Decim for AIS (complex)
+    int acc_ais_count;
+    float acc_ais_i;
+    float acc_ais_q;
 
     // FM demod previous IQ (at FS1)
     float i_prev;
     float q_prev;
     int have_prev;
 
-    // Small temp AIS buffer (raw demod @ 48k)
-    float ais_tmp[4096];
-    uint32_t ais_tmp_len;
-    
 } dsp_state_t;
 
 static dsp_state_t g_dsp;
@@ -147,8 +152,10 @@ static dsp_state_t g_dsp;
 typedef struct {
     const char* name;
     int needs_audio; // 1 = uses PortAudio output
+    int fs_demod;
     void (*init)(int fs_demod);
-    void (*process_sample)(float sample);
+    void (*process_fm)(float sample);
+    void (*process_iq)(float i, float q);
     void (*flush)(void);
 } decoder_ops_t;
 
@@ -156,14 +163,14 @@ static void voice_init_decoder(int fs_demod);
 static void voice_process_sample_decoder(float sample);
 static void voice_flush_decoder(void);
 static void ais_init_decoder(int fs_demod);
-static void ais_process_sample(float sample);
-static void ais_flush(void);
+static void ais_process_sample_iq_decoder(float i, float q);
+static void ais_flush_decoder(void);
 
 // Add new decoders here.
 static const decoder_ops_t g_decoders[] = {
-    { "voice", 1, voice_init_decoder, voice_process_sample_decoder, voice_flush_decoder },
-    { "ais",   0, ais_init_decoder, ais_process_sample, ais_flush },
-    { NULL,    0, NULL, NULL, NULL }
+    { "voice", 1, VOICE_FS, voice_init_decoder, voice_process_sample_decoder, NULL,                    voice_flush_decoder },
+    { "ais",   0, AIS_FS,   ais_init_decoder,   NULL,                         ais_process_sample_iq_decoder,  ais_flush_decoder },
+    { NULL,    0, 0,        NULL,               NULL,                         NULL,                    NULL }
 };
 
 static const decoder_ops_t* g_decoder = NULL;
@@ -189,7 +196,7 @@ static void rtlsdr_cb(unsigned char* buf, uint32_t len, void* ctx) {
         int32_t i = (int32_t)buf[p]   - 127;
         int32_t q = (int32_t)buf[p+1] - 127;
 
-        // --- Decim1: 2.4M -> 240k by averaging 10 samples ---
+        // --- Decim1: 2.4M -> 480k by averaging 5 samples ---
         g_dsp.acc1_i += i;
         g_dsp.acc1_q += q;
         g_dsp.acc1_count++;
@@ -202,28 +209,43 @@ static void rtlsdr_cb(unsigned char* buf, uint32_t len, void* ctx) {
             g_dsp.acc1_q = 0;
             g_dsp.acc1_count = 0;
 
-            // --- FM demod at 240k ---
-            float dem;
-            if (!g_dsp.have_prev) {
+            if (g_decoder && g_decoder->process_iq) {
+                // --- AIS path: complex decim 480k -> 96k ---
+                g_dsp.acc_ais_i += I1;
+                g_dsp.acc_ais_q += Q1;
+                g_dsp.acc_ais_count++;
+                if (g_dsp.acc_ais_count == DECIM_AIS) {
+                    float I2 = g_dsp.acc_ais_i / (float)DECIM_AIS;
+                    float Q2 = g_dsp.acc_ais_q / (float)DECIM_AIS;
+                    g_dsp.acc_ais_i = 0.0f;
+                    g_dsp.acc_ais_q = 0.0f;
+                    g_dsp.acc_ais_count = 0;
+                    g_decoder->process_iq(I2, Q2);
+                }
+            } else {
+                // --- Voice path: FM demod at 480k ---
+                float dem;
+                if (!g_dsp.have_prev) {
+                    g_dsp.i_prev = I1;
+                    g_dsp.q_prev = Q1;
+                    g_dsp.have_prev = 1;
+                    continue;
+                }
+                dem = fm_discriminator(I1, Q1, g_dsp.i_prev, g_dsp.q_prev);
                 g_dsp.i_prev = I1;
                 g_dsp.q_prev = Q1;
-                g_dsp.have_prev = 1;
-                continue;
-            }
-            dem = fm_discriminator(I1, Q1, g_dsp.i_prev, g_dsp.q_prev);
-            g_dsp.i_prev = I1;
-            g_dsp.q_prev = Q1;
 
-            // --- Decim2: 240k -> 48k (average 5 demod samples) ---
-            g_dsp.acc2 += dem;
-            g_dsp.acc2_count++;
+                // --- Decim2: 480k -> 240k (average 2 demod samples) ---
+                g_dsp.acc2 += dem;
+                g_dsp.acc2_count++;
 
-            if (g_dsp.acc2_count == DECIM2) {
-                float a = g_dsp.acc2 / (float)DECIM2;
-                g_dsp.acc2 = 0.0f;
-                g_dsp.acc2_count = 0;
-                if (g_decoder && g_decoder->process_sample) {
-                    g_decoder->process_sample(a);
+                if (g_dsp.acc2_count == DECIM2) {
+                    float a = g_dsp.acc2 / (float)DECIM2;
+                    g_dsp.acc2 = 0.0f;
+                    g_dsp.acc2_count = 0;
+                    if (g_decoder && g_decoder->process_fm) {
+                        g_decoder->process_fm(a);
+                    }
                 }
             }
         }
@@ -250,21 +272,14 @@ static void voice_flush_decoder(void) {
 
 static void ais_init_decoder(int fs_demod) {
     ais_init(&g_ais, fs_demod);
-    g_dsp.ais_tmp_len = 0;
 }
 
-static void ais_process_sample(float sample) {
-    g_dsp.ais_tmp[g_dsp.ais_tmp_len++] = sample;
-    if (g_dsp.ais_tmp_len >= 4096) {
-        ais_feed_samples(&g_ais, g_dsp.ais_tmp, g_dsp.ais_tmp_len);
-        g_dsp.ais_tmp_len = 0;
-    }
+static void ais_process_sample_iq_decoder(float i, float q) {
+    ais_process_sample_iq(&g_ais, i, q);
 }
 
-static void ais_flush(void) {
-    if (g_dsp.ais_tmp_len == 0) return;
-    ais_feed_samples(&g_ais, g_dsp.ais_tmp, g_dsp.ais_tmp_len);
-    g_dsp.ais_tmp_len = 0;
+static void ais_flush_decoder(void) {
+    ais_flush(&g_ais);
 }
 
 static void usage(const char* prog) {
@@ -381,7 +396,7 @@ int main(int argc, char** argv) {
 
     memset(&g_ring, 0, sizeof(g_ring));
     memset(&g_dsp, 0, sizeof(g_dsp));
-    if (g_decoder->init) g_decoder->init(AUDIO_FS);
+    if (g_decoder->init) g_decoder->init(g_decoder->fs_demod);
 
     if (ais_test) {
         if (streq_icase(g_decoder->name, "ais")) {
@@ -452,8 +467,8 @@ int main(int argc, char** argv) {
     }
 
     printf("START WFM C (async)\n");
-    printf("  freq=%.3f MHz | sdr_fs=%d | audio_fs=%d | gain=%s | mode=%s",
-           freq_mhz, SDR_FS, AUDIO_FS, gain_desc, g_decoder->name);
+    printf("  freq=%.3f MHz | sdr_fs=%d | demod_fs=%d | gain=%s | mode=%s",
+           freq_mhz, SDR_FS, g_decoder->fs_demod, gain_desc, g_decoder->name);
     if (have_ppm) printf(" | ppm=%d", ppm);
     if (tuner_bw) printf(" | bw=%u", tuner_bw);
     printf("\n");
@@ -475,7 +490,7 @@ int main(int argc, char** argv) {
                                   0,          // no input
                                   1,          // mono output
                                   paFloat32,  // float32 output
-                                  AUDIO_FS,
+                                  VOICE_FS,
                                   1024,       // frames per buffer
                                   pa_cb,
                                   NULL);
