@@ -14,20 +14,22 @@
 
 #include "modules/header/ais_decoder.h"
 #include "modules/header/adsb_decoder.h"
+#include "modules/header/voice_module.h"
 #include "demod/header/demodulator.h"
 
 static volatile int g_stop = 0;
 static rtlsdr_dev_t *g_dev = NULL;
 static demodulator_t g_demod;
 
+static voice_module_t g_voice;
 static ais_ctx_t g_ais;
 static adsb_ctx_t g_adsb;
 
 typedef struct {
     const char *name;
     void *ctx;
-    void (*init)(void *ctx, const demod_config_t *cfg);
-    void (*fill_demod_config)(demod_config_t *cfg);
+    int (*init)(void *ctx, const demod_config_t *cfg);
+    void (*fill_demod_config)(void *ctx, demod_config_t *cfg);
     demod_output_t (*get_demod_output)(void *ctx);
     void (*flush)(void *ctx);
     void (*run_test)(void *ctx);
@@ -53,6 +55,8 @@ static const char *demod_kind_name(demod_kind_t kind) {
     switch (kind) {
     case DEMOD_KIND_AM:
         return "am";
+    case DEMOD_KIND_FM:
+        return "fm";
     case DEMOD_KIND_GMSK:
         return "gmsk";
     case DEMOD_KIND_NONE:
@@ -67,9 +71,31 @@ static void rtlsdr_cb(unsigned char *buf, uint32_t len, void *ctx) {
     demodulator_process_raw_iq_u8(&g_demod, buf, len);
 }
 
-static void ais_init_module(void *ctx, const demod_config_t *cfg) {
+static int voice_init_module(void *ctx, const demod_config_t *cfg) {
+    return voice_module_init((voice_module_t *)ctx, cfg);
+}
+
+static void voice_fill_demod_config_module(void *ctx, demod_config_t *cfg) {
+    voice_module_get_demod_config((voice_module_t *)ctx, cfg);
+}
+
+static demod_output_t voice_get_demod_output_module(void *ctx) {
+    return voice_module_get_demod_output((voice_module_t *)ctx);
+}
+
+static void voice_flush_module(void *ctx) {
+    voice_module_flush((voice_module_t *)ctx);
+}
+
+static int ais_init_module(void *ctx, const demod_config_t *cfg) {
     (void)cfg;
     ais_init((ais_ctx_t *)ctx);
+    return 1;
+}
+
+static void ais_fill_demod_config_module(void *ctx, demod_config_t *cfg) {
+    (void)ctx;
+    ais_get_demod_config(cfg);
 }
 
 static demod_output_t ais_get_demod_output_module(void *ctx) {
@@ -85,8 +111,14 @@ static void ais_run_test_module(void *ctx) {
     ais_test_emit_example();
 }
 
-static void adsb_init_module(void *ctx, const demod_config_t *cfg) {
+static int adsb_init_module(void *ctx, const demod_config_t *cfg) {
     adsb_init((adsb_ctx_t *)ctx, cfg ? cfg->output_fs : 0);
+    return 1;
+}
+
+static void adsb_fill_demod_config_module(void *ctx, demod_config_t *cfg) {
+    (void)ctx;
+    adsb_get_demod_config(cfg);
 }
 
 static demod_output_t adsb_get_demod_output_module(void *ctx) {
@@ -102,14 +134,16 @@ static void adsb_run_test_module(void *ctx) {
 }
 
 static const module_ops_t g_modules[] = {
-    { "ais",  &g_ais,  ais_init_module,  ais_get_demod_config,  ais_get_demod_output_module,  ais_flush_module,  ais_run_test_module  },
-    { "adsb", &g_adsb, adsb_init_module, adsb_get_demod_config, adsb_get_demod_output_module, adsb_flush_module, adsb_run_test_module },
-    { NULL,   NULL,    NULL,             NULL,                   NULL,                          NULL,              NULL                 }
+    { "voice", &g_voice, voice_init_module, voice_fill_demod_config_module, voice_get_demod_output_module, voice_flush_module, NULL                 },
+    { "ais",   &g_ais,   ais_init_module,   ais_fill_demod_config_module,   ais_get_demod_output_module,   ais_flush_module,   ais_run_test_module  },
+    { "adsb",  &g_adsb,  adsb_init_module,  adsb_fill_demod_config_module,  adsb_get_demod_output_module,  adsb_flush_module,  adsb_run_test_module },
+    { NULL,    NULL,     NULL,              NULL,                            NULL,                           NULL,               NULL                 }
 };
 
 static const module_ops_t *find_module(const char *name) {
     if (!name) return NULL;
     if (streq_icase(name, "adsb") || streq_icase(name, "adb-s")) name = "adsb";
+    if (streq_icase(name, "voce")) name = "voice";
     for (int i = 0; g_modules[i].name; i++) {
         if (streq_icase(name, g_modules[i].name)) return &g_modules[i];
     }
@@ -118,12 +152,16 @@ static const module_ops_t *find_module(const char *name) {
 
 static void usage(const char *prog) {
     fprintf(stderr, "Usage: %s <freq_mhz> [gain_db] [mode]\n", prog);
-    fprintf(stderr, "       %s <freq_mhz> [gain_db] --mode <ais|adsb>\n", prog);
+    fprintf(stderr, "       %s <freq_mhz> [gain_db] --mode <voice|ais|adsb>\n", prog);
+    fprintf(stderr, "       %s <freq_mhz> --mode voice [--demod <fm|am>]\n", prog);
     fprintf(stderr, "       %s <freq_mhz> --mode ais --ais-test\n", prog);
     fprintf(stderr, "       %s <freq_mhz> --mode adsb --adsb-test\n", prog);
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  --ppm <int>   frequency correction (e.g. -20, +35)\n");
     fprintf(stderr, "  --bw  <hz>    tuner bandwidth (Hz), 0=auto\n");
+    fprintf(stderr, "  --demod <x>   voice demodulator: fm (default) or am\n");
+    fprintf(stderr, "Example: %s 145.500 --mode voice --demod fm\n", prog);
+    fprintf(stderr, "         %s 118.300 --mode voice --demod am\n", prog);
     fprintf(stderr, "Example: %s 162.025 --mode ais --ppm -20 --bw 25000\n", prog);
     fprintf(stderr, "         %s 1090.0 --mode adsb\n", prog);
 }
@@ -138,6 +176,7 @@ static int parse_int_arg(const char *s, int *out) {
 
 int main(int argc, char **argv) {
     signal(SIGINT, on_sigint);
+    voice_module_reset(&g_voice);
 
     if (argc < 2) {
         usage(argv[0]);
@@ -153,6 +192,7 @@ int main(int argc, char **argv) {
     int ppm = 0;
     int have_ppm = 0;
     uint32_t tuner_bw = 0;
+    const char *voice_demod = NULL;
 
     for (int i = 2; i < argc; i++) {
         const char *arg = argv[i];
@@ -200,8 +240,18 @@ int main(int argc, char **argv) {
             tuner_bw = (uint32_t)parsed_bw;
             continue;
         }
-        if (streq_icase(arg, "ais") || streq_icase(arg, "adsb")
-            || streq_icase(arg, "adsb") || streq_icase(arg, "adb-s")) {
+        if (strcmp(arg, "--demod") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Missing value for %s\n", arg);
+                usage(argv[0]);
+                return 1;
+            }
+            voice_demod = argv[++i];
+            continue;
+        }
+        if (streq_icase(arg, "voice") || streq_icase(arg, "voce")
+            || streq_icase(arg, "ais") || streq_icase(arg, "adsb")
+            || streq_icase(arg, "adb-s")) {
             module_name = arg;
             continue;
         }
@@ -218,6 +268,18 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    if (streq_icase(module_name, "voice")) {
+        if (!voice_module_set_demod(&g_voice, voice_demod)) {
+            fprintf(stderr, "Unknown voice demodulation: %s\n", voice_demod);
+            usage(argv[0]);
+            return 1;
+        }
+    } else if (voice_demod) {
+        fprintf(stderr, "--demod works only with mode=voice\n");
+        usage(argv[0]);
+        return 1;
+    }
+
     const module_ops_t *module = find_module(module_name);
     if (!module) {
         fprintf(stderr, "Unknown mode/module: %s\n", module_name);
@@ -227,13 +289,17 @@ int main(int argc, char **argv) {
 
     demod_config_t demod_cfg;
     memset(&demod_cfg, 0, sizeof(demod_cfg));
-    module->fill_demod_config(&demod_cfg);
+    module->fill_demod_config(module->ctx, &demod_cfg);
     if (demod_cfg.kind == DEMOD_KIND_NONE || demod_cfg.input_fs <= 0 || demod_cfg.output_fs <= 0) {
         fprintf(stderr, "Invalid demodulator config for mode=%s\n", module->name);
         return 1;
     }
 
-    module->init(module->ctx, &demod_cfg);
+    if (!module->init(module->ctx, &demod_cfg)) {
+        fprintf(stderr, "Failed to initialize mode=%s\n", module->name);
+        module->flush(module->ctx);
+        return 1;
+    }
 
     if (ais_test) {
         if (!streq_icase(module->name, "ais")) {

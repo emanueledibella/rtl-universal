@@ -32,15 +32,17 @@ static void voice_flush_block(voice_ctx_t* ctx) {
     ctx->tmp_len = 0;
 }
 
-void voice_decoder_init(voice_ctx_t* ctx, int fs_demod, voice_output_cb_t out_cb, void* out_user) {
+void voice_decoder_init(voice_ctx_t* ctx, int fs_demod, float deemph_tau_s,
+                        voice_output_cb_t out_cb, void* out_user) {
     memset(ctx, 0, sizeof(*ctx));
     ctx->out_cb = out_cb;
     ctx->out_user = out_user;
 
-    // De-emphasis alpha
-    // a = exp(-1/(fs*tau))
-    const float tau = 50e-6f;
-    ctx->deemph_a = expf(-1.0f / ((float)fs_demod * tau));
+    if (deemph_tau_s > 0.0f && fs_demod > 0) {
+        ctx->deemph_a = expf(-1.0f / ((float)fs_demod * deemph_tau_s));
+    } else {
+        ctx->deemph_a = 0.0f;
+    }
     ctx->deemph_y1 = 0.0f;
 
     ctx->flush_threshold = 2048;
@@ -64,4 +66,3 @@ void voice_decoder_process_sample(voice_ctx_t* ctx, float sample) {
 void voice_decoder_flush(voice_ctx_t* ctx) {
     voice_flush_block(ctx);
 }
-

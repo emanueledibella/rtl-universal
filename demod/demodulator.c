@@ -17,6 +17,14 @@ int demodulator_init(demodulator_t *ctx, const demod_config_t *config, const dem
         am_cfg.dc_alpha = config->u.am.dc_alpha;
         return am_demod_init(&ctx->u.am, &am_cfg, output->on_float, output->user);
     }
+    case DEMOD_KIND_FM: {
+        fm_demod_config_t fm_cfg;
+        memset(&fm_cfg, 0, sizeof(fm_cfg));
+        fm_cfg.input_fs = config->input_fs;
+        fm_cfg.output_fs = config->output_fs;
+        fm_cfg.dc_alpha = config->u.fm.dc_alpha;
+        return fm_demod_init(&ctx->u.fm, &fm_cfg, output->on_float, output->user);
+    }
     case DEMOD_KIND_GMSK: {
         gmsk_demod_config_t gmsk_cfg;
         memset(&gmsk_cfg, 0, sizeof(gmsk_cfg));
@@ -40,6 +48,9 @@ void demodulator_process_raw_iq_u8(demodulator_t *ctx, const unsigned char *buf,
     case DEMOD_KIND_AM:
         am_demod_process_raw_iq_u8(&ctx->u.am, buf, len);
         break;
+    case DEMOD_KIND_FM:
+        fm_demod_process_raw_iq_u8(&ctx->u.fm, buf, len);
+        break;
     case DEMOD_KIND_GMSK:
         gmsk_demod_process_raw_iq_u8(&ctx->u.gmsk, buf, len);
         break;
@@ -55,6 +66,9 @@ void demodulator_flush(demodulator_t *ctx) {
     switch (ctx->kind) {
     case DEMOD_KIND_AM:
         am_demod_flush(&ctx->u.am);
+        break;
+    case DEMOD_KIND_FM:
+        fm_demod_flush(&ctx->u.fm);
         break;
     case DEMOD_KIND_GMSK:
         gmsk_demod_flush(&ctx->u.gmsk);

@@ -3,6 +3,7 @@
 #include <stdint.h>
 
 #include "am_demod.h"
+#include "fm_demod.h"
 #include "gmsk_demod.h"
 
 #ifdef __cplusplus
@@ -12,6 +13,7 @@ extern "C" {
 typedef enum {
     DEMOD_KIND_NONE = 0,
     DEMOD_KIND_AM,
+    DEMOD_KIND_FM,
     DEMOD_KIND_GMSK,
 } demod_kind_t;
 
@@ -34,6 +36,9 @@ typedef struct {
         struct {
             float dc_alpha;
         } am;
+        struct {
+            float dc_alpha;
+        } fm;
     } u;
 } demod_config_t;
 
@@ -41,6 +46,7 @@ typedef struct {
     demod_kind_t kind;
     union {
         am_demod_ctx_t am;
+        fm_demod_ctx_t fm;
         gmsk_demod_ctx_t gmsk;
     } u;
 } demodulator_t;

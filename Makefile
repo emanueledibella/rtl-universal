@@ -1,7 +1,7 @@
 CC = cc
 CFLAGS = -O2 -std=c11 -I/opt/homebrew/include -Idemod/header
 LDFLAGS = -L/opt/homebrew/lib
-LDLIBS = -lrtlsdr -lliquid -lusb-1.0 -lm
+LDLIBS = -lrtlsdr -lliquid -lportaudio -lusb-1.0 -lm
 
 SRC = wfm_live.c $(wildcard modules/*.c) $(wildcard demod/*.c)
 OBJ = antenna.o

@@ -23,11 +23,11 @@ typedef struct {
 } voice_ctx_t;
 
 // fs_demod: sample rate of demodulated samples (e.g. 48000)
-void voice_decoder_init(voice_ctx_t* ctx, int fs_demod, voice_output_cb_t out_cb, void* out_user);
+void voice_decoder_init(voice_ctx_t* ctx, int fs_demod, float deemph_tau_s,
+                        voice_output_cb_t out_cb, void* out_user);
 void voice_decoder_process_sample(voice_ctx_t* ctx, float sample);
 void voice_decoder_flush(voice_ctx_t* ctx);
 
 #ifdef __cplusplus
 }
 #endif
-

@@ -19,6 +19,9 @@ typedef struct {
     am_demod_output_cb_t out_cb;
     void *out_user;
     float dc_estimate;
+    int decim;
+    int decim_count;
+    float decim_acc;
 } am_demod_ctx_t;
 
 int am_demod_init(am_demod_ctx_t *ctx, const am_demod_config_t *cfg,

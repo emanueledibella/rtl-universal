@@ -175,7 +175,10 @@ static uint64_t bits_get_u64(const uint8_t *bytes, int start_bit, int bit_len) {
 void adsb_on_clean_frame(const uint8_t *frame, size_t frame_bits) {
     size_t frame_bytes = frame_bits / 8u;
     uint32_t df;
-    uint32_t subtype;
+    uint32_t ca;
+    uint32_t icao;
+    uint32_t me;
+    uint32_t pi;
 
     printf("[adsb] frame bits=%zu bytes=%zu hex=", frame_bits, frame_bytes);
     for (size_t i = 0; i < frame_bytes; i++) {
@@ -189,22 +192,22 @@ void adsb_on_clean_frame(const uint8_t *frame, size_t frame_bits) {
     }
 
     df = bits_get_u32(frame, 0, 5);
-    subtype = bits_get_u32(frame, 5, 3);
+    ca = bits_get_u32(frame, 5, 3);
 
     if (frame_bits == adsb_LONG_FRAME_BITS) {
         uint32_t aa = bits_get_u32(frame, 8, 24);
         uint64_t me = bits_get_u64(frame, 32, 56);
         uint32_t parity = bits_get_u32(frame, 88, 24);
         printf("[adsb] parsed df=%u ca=%u aa=%06X me=%014llX parity=%06X\n",
-               df, subtype, aa, (unsigned long long)me, parity);
+               df, ca, aa, (unsigned long long)me, parity);
         return;
     }
 
     {
         uint32_t payload = bits_get_u32(frame, 8, 24);
         uint32_t parity = bits_get_u32(frame, 32, 24);
-        printf("[adsb] parsed df=%u subtype=%u payload=%06X parity=%06X\n",
-               df, subtype, payload, parity);
+        printf("[adsb] parsed df=%u ca=%u payload=%06X parity=%06X\n",
+               df, ca, payload, parity);
     }
 }
 
