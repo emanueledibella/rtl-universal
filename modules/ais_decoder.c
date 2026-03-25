@@ -4,6 +4,7 @@
 #include <math.h>
 #include <stdlib.h>
 #include <complex.h>
+#include <ctype.h>
 
 // ---- CRC-16 (HDLC/PPP style, reflected 0x1021 -> 0x8408) ----
 static uint16_t crc16_hdlc(const uint8_t *data, size_t len) {
@@ -35,6 +36,33 @@ static void buf_push_bit_lsb(ais_ctx_t *ctx, int bit) {
     }
 }
 
+static void buf_drop_tail_bits(ais_ctx_t *ctx, size_t nbits) {
+    size_t total_bits = (ctx->buf_len * 8u) + (size_t)ctx->cur_bitpos;
+    if (nbits >= total_bits) {
+        buf_reset(ctx);
+        return;
+    }
+
+    size_t new_total = total_bits - nbits;
+    size_t new_buf_len = new_total / 8u;
+    int new_cur_bitpos = (int)(new_total % 8u);
+
+    if (new_cur_bitpos == 0) {
+        ctx->cur_byte = 0;
+        ctx->cur_bitpos = 0;
+    } else {
+        uint8_t mask = (uint8_t)((1u << new_cur_bitpos) - 1u);
+        if (new_buf_len < ctx->buf_len) {
+            ctx->cur_byte = (uint8_t)(ctx->buf[new_buf_len] & mask);
+        } else {
+            ctx->cur_byte = (uint8_t)(ctx->cur_byte & mask);
+        }
+        ctx->cur_bitpos = new_cur_bitpos;
+    }
+
+    ctx->buf_len = new_buf_len;
+}
+
 // Flag HDLC 0x7E = 0b01111110 (LSB-first in stream -> pattern detection via shift reg)
 static int is_flag_0x7E(uint8_t last8) {
     return last8 == 0x7E;
@@ -56,6 +84,54 @@ static uint32_t get_bits(const uint8_t *bytes, int start_bit, int bit_len) {
     return v;
 }
 
+static int32_t get_sbits(const uint8_t *bytes, int start_bit, int bit_len) {
+    uint32_t v = get_bits(bytes, start_bit, bit_len);
+    if (bit_len <= 0 || bit_len >= 32) return (int32_t)v;
+    uint32_t sign = 1u << (bit_len - 1);
+    if (v & sign) {
+        v |= ~((1u << bit_len) - 1u);
+    }
+    return (int32_t)v;
+}
+
+static char ais_sixbit_to_char(uint8_t v) {
+    v &= 0x3F;
+    if (v < 32) {
+        static const char t0[32] = "@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_";
+        return t0[v];
+    }
+    static const char t1[32] = " !\"#$%&'()*+,-./0123456789:;<=>?";
+    return t1[v - 32];
+}
+
+static void ais_get_text(const uint8_t *info, int start_bit, int n_chars, char *out, size_t out_sz) {
+    if (!out || out_sz == 0) return;
+    int n = n_chars;
+    if (n < 0) n = 0;
+    if ((size_t)n + 1 > out_sz) n = (int)out_sz - 1;
+
+    for (int i = 0; i < n; i++) {
+        uint8_t c6 = (uint8_t)get_bits(info, start_bit + i * 6, 6);
+        out[i] = ais_sixbit_to_char(c6);
+    }
+    out[n] = '\0';
+
+    // trim trailing spaces and '@' padding
+    for (int i = n - 1; i >= 0; i--) {
+        if (out[i] == ' ' || out[i] == '@') out[i] = '\0';
+        else break;
+    }
+
+    // replace non-printable with '.'
+    for (int i = 0; out[i] != '\0'; i++) {
+        if (!isprint((unsigned char)out[i])) out[i] = '.';
+    }
+}
+
+static int ais_has_bits(size_t info_len, int bits_required) {
+    return (int)(info_len * 8u) >= bits_required;
+}
+
 // Stampa base di alcuni tipi (1/2/3 e 5)
 static void ais_parse_and_print(const uint8_t *info, size_t info_len) {
     // info = bytes "Information field" (senza FCS), contenenti il payload AIS (bitstream)
@@ -69,24 +145,125 @@ static void ais_parse_and_print(const uint8_t *info, size_t info_len) {
     printf("[AIS] type=%u mmsi=%u\n", msg_type, mmsi);
 
     if (msg_type == 1 || msg_type == 2 || msg_type == 3) {
-        // Position report class A (semplificato)
-        int32_t lon_raw = (int32_t)get_bits(info, 61, 28);
-        int32_t lat_raw = (int32_t)get_bits(info, 89, 27);
+        if (!ais_has_bits(info_len, 168)) {
+            printf("      warning: payload too short for type %u\n", msg_type);
+            return;
+        }
 
-        // convert signed two's complement
-        if (lon_raw & (1 << 27)) lon_raw |= ~((1 << 28) - 1);
-        if (lat_raw & (1 << 26)) lat_raw |= ~((1 << 27) - 1);
+        // Position report class A
+        uint32_t nav_status = get_bits(info, 38, 4);
+        uint32_t sog = get_bits(info, 50, 10); // speed over ground *10
+        int32_t lon_raw = get_sbits(info, 61, 28);
+        int32_t lat_raw = get_sbits(info, 89, 27);
+        uint32_t cog = get_bits(info, 116, 12);      // *10 deg
+        uint32_t hdg = get_bits(info, 128, 9);       // deg
+        uint32_t ts  = get_bits(info, 137, 6);       // sec
 
         double lon = lon_raw / 600000.0;
         double lat = lat_raw / 600000.0;
-
-        uint32_t sog = get_bits(info, 50, 10); // speed over ground *10
         double sog_kn = sog / 10.0;
+        double cog_deg = cog / 10.0;
 
-        printf("      pos: lat=%.5f lon=%.5f sog=%.1f kn\n", lat, lon, sog_kn);
+        printf("      classA: nav=%u lat=%.5f lon=%.5f sog=%.1f kn cog=%.1f hdg=%u ts=%u\n",
+               nav_status, lat, lon, sog_kn, cog_deg, hdg, ts);
     } else if (msg_type == 5) {
-        // Static and voyage related data (qui stampiamo solo MMSI già sopra)
-        printf("      (type 5 static/voyage data)\n");
+        if (!ais_has_bits(info_len, 424)) {
+            printf("      warning: payload too short for type 5\n");
+            return;
+        }
+
+        uint32_t imo = get_bits(info, 40, 30);
+        uint32_t ship_type = get_bits(info, 232, 8);
+        uint32_t to_bow = get_bits(info, 240, 9);
+        uint32_t to_stern = get_bits(info, 249, 9);
+        uint32_t to_port = get_bits(info, 258, 6);
+        uint32_t to_starboard = get_bits(info, 264, 6);
+        uint32_t eta_month = get_bits(info, 274, 4);
+        uint32_t eta_day = get_bits(info, 278, 5);
+        uint32_t eta_hour = get_bits(info, 283, 5);
+        uint32_t eta_min = get_bits(info, 288, 6);
+        uint32_t draught_dm = get_bits(info, 294, 8); // 0.1m
+
+        char callsign[8];
+        char name[21];
+        char dest[21];
+        ais_get_text(info, 70, 7, callsign, sizeof(callsign));
+        ais_get_text(info, 112, 20, name, sizeof(name));
+        ais_get_text(info, 302, 20, dest, sizeof(dest));
+
+        printf("      type5: imo=%u callsign=%s name=%s ship_type=%u dim=%u/%u/%u/%u eta=%02u-%02u %02u:%02u draught=%.1fm dest=%s\n",
+               imo, callsign, name, ship_type, to_bow, to_stern, to_port, to_starboard,
+               eta_month, eta_day, eta_hour, eta_min, draught_dm / 10.0, dest);
+    } else if (msg_type == 18) {
+        if (!ais_has_bits(info_len, 168)) {
+            printf("      warning: payload too short for type 18\n");
+            return;
+        }
+
+        uint32_t sog = get_bits(info, 46, 10);
+        int32_t lon_raw = get_sbits(info, 57, 28);
+        int32_t lat_raw = get_sbits(info, 85, 27);
+        uint32_t cog = get_bits(info, 112, 12);
+        uint32_t hdg = get_bits(info, 124, 9);
+        uint32_t ts  = get_bits(info, 133, 6);
+
+        printf("      classB: lat=%.5f lon=%.5f sog=%.1f kn cog=%.1f hdg=%u ts=%u\n",
+               lat_raw / 600000.0, lon_raw / 600000.0, sog / 10.0, cog / 10.0, hdg, ts);
+    } else if (msg_type == 19) {
+        if (!ais_has_bits(info_len, 312)) {
+            printf("      warning: payload too short for type 19\n");
+            return;
+        }
+
+        uint32_t sog = get_bits(info, 46, 10);
+        int32_t lon_raw = get_sbits(info, 57, 28);
+        int32_t lat_raw = get_sbits(info, 85, 27);
+        uint32_t cog = get_bits(info, 112, 12);
+        uint32_t hdg = get_bits(info, 124, 9);
+        uint32_t ship_type = get_bits(info, 263, 8);
+        uint32_t to_bow = get_bits(info, 271, 9);
+        uint32_t to_stern = get_bits(info, 280, 9);
+        uint32_t to_port = get_bits(info, 289, 6);
+        uint32_t to_starboard = get_bits(info, 295, 6);
+        char name[21];
+        ais_get_text(info, 143, 20, name, sizeof(name));
+
+        printf("      classB-ext: name=%s ship_type=%u lat=%.5f lon=%.5f sog=%.1f kn cog=%.1f hdg=%u dim=%u/%u/%u/%u\n",
+               name, ship_type, lat_raw / 600000.0, lon_raw / 600000.0, sog / 10.0, cog / 10.0, hdg,
+               to_bow, to_stern, to_port, to_starboard);
+    } else if (msg_type == 24) {
+        if (!ais_has_bits(info_len, 160)) {
+            printf("      warning: payload too short for type 24\n");
+            return;
+        }
+
+        uint32_t part_no = get_bits(info, 38, 2);
+        if (part_no == 0) {
+            char name[21];
+            ais_get_text(info, 40, 20, name, sizeof(name));
+            printf("      type24A: name=%s\n", name);
+        } else if (part_no == 1) {
+            if (!ais_has_bits(info_len, 168)) {
+                printf("      warning: payload too short for type 24B\n");
+                return;
+            }
+            uint32_t ship_type = get_bits(info, 40, 8);
+            uint32_t to_bow = get_bits(info, 132, 9);
+            uint32_t to_stern = get_bits(info, 141, 9);
+            uint32_t to_port = get_bits(info, 150, 6);
+            uint32_t to_starboard = get_bits(info, 156, 6);
+            char vendor[8];
+            char callsign[8];
+            ais_get_text(info, 48, 7, vendor, sizeof(vendor));
+            ais_get_text(info, 90, 7, callsign, sizeof(callsign));
+
+            printf("      type24B: ship_type=%u vendor=%s callsign=%s dim=%u/%u/%u/%u\n",
+                   ship_type, vendor, callsign, to_bow, to_stern, to_port, to_starboard);
+        } else {
+            printf("      type24: invalid part=%u\n", part_no);
+        }
+    } else {
+        printf("      payload bits=%zu (parser base)\n", info_len * 8u);
     }
 }
 
@@ -155,6 +332,9 @@ static void hdlc_push_bit(ais_ctx_t *ctx, int bit) {
 
     if (is_flag_0x7E((uint8_t)ctx->shift_reg)) {
         if (ctx->in_frame) {
+            // I 7 bit precedenti sono i primi 7 bit del flag di chiusura.
+            // Rimuoviamoli dal payload prima della validazione CRC.
+            buf_drop_tail_bits(ctx, 7);
             // fine frame
             hdlc_end_frame(ctx);
         }
@@ -171,17 +351,25 @@ static void hdlc_push_bit(ais_ctx_t *ctx, int bit) {
     // --- bit destuffing (HDLC): dopo 5 '1' consecutivi, lo zero successivo è stuffing ---
     if (ctx->skip_next_zero) {
         ctx->skip_next_zero = 0;
-        if (decoded == 0) return; // stuffed, discard
-        // se non è zero, frame corrotto: reset
-        ctx->in_frame = 0;
-        buf_reset(ctx);
-        return;
+        if (decoded == 0) {
+            // stuffed zero: termina la sequenza di 1.
+            ctx->ones_count = 0;
+            return;
+        }
+        // Se è 1, non è stuffed (può essere parte di flag/abort): continua.
     }
 
     if (decoded == 1) {
         ctx->ones_count++;
         if (ctx->ones_count == 5) {
             ctx->skip_next_zero = 1;
+        } else if (ctx->ones_count >= 7) {
+            // HDLC abort / rumore: reset del frame corrente.
+            ctx->in_frame = 0;
+            ctx->ones_count = 0;
+            ctx->skip_next_zero = 0;
+            buf_reset(ctx);
+            return;
         }
     } else {
         ctx->ones_count = 0;
