@@ -1,58 +1,37 @@
 // wfm_live.c
-// Minimal WFM (FM broadcast) mono receiver: RTL-SDR -> FM demod -> PortAudio
-// Build (Homebrew):
-//   cc -O2 -std=c11 wfm_live.c modules/ais_decoder.c modules/voice_decoder.c -o wfm_live \
-//     $(pkg-config --cflags --libs librtlsdr portaudio-2.0 liquid) -lm
-//   (se pkg-config non trova "liquid", prova "liquid-dsp")
-//
-// Run:
-//   ./wfm_live 100.0   (MHz)             [voice default]
-// Optional gain (dB) and mode:
-//   ./wfm_live 100.0 20 voice
-//   ./wfm_live 162.0 --mode ais
-//   ./wfm_live 162.0 --mode ais --ais-test
-//
-// Notes:
-// - Uses async read (stable like rtl_fm).
-// - Downsamples 2.4 MS/s -> 480 kS/s (decim=5) using simple boxcar averaging.
-// - Voice: FM demod at 480 kS/s, then 480 -> 240 kS/s (decim=2).
-// - AIS: complex downsample 480 -> 96 kS/s (decim=5), then GMSK demod.
-// - De-emphasis 50us (EU) 1-pole IIR.
+// Main entry-point: selects the protocol module, asks the module which
+// demodulator it needs, then forwards raw RTL-SDR IQ samples to that
+// demodulator. All protocol-specific DSP lives outside this file.
 
+#include <ctype.h>
+#include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <stdint.h>
-#include <math.h>
-#include <signal.h>
 #include <string.h>
-#include <ctype.h>
 
 #include <rtl-sdr.h>
-#include <portaudio.h>
+
 #include "modules/header/ais_decoder.h"
-#include "modules/header/voice_decoder.h"
+#include "modules/header/adbs_decoder.h"
+#include "demod/header/demodulator.h"
 
-#define SDR_FS        2400000   // 2.4 MS/s
-#define VOICE_FS      240000    // voice demod output (after DECIM2)
-#define AIS_FS        96000     // AIS complex sample rate for GMSK demod
-#define DECIM1        5         // 2.4M -> 480k
-#define DECIM2        2         // 480k -> 240k (voice)
-#define DECIM_AIS     5         // 480k -> 96k (AIS)
-
-// ring buffer seconds (audio)
-#define RING_SECONDS  4
-#define RING_SIZE     (VOICE_FS * RING_SECONDS)
-
-// ------------ globals / state ------------
 static volatile int g_stop = 0;
-static rtlsdr_dev_t* g_dev = NULL;
+static rtlsdr_dev_t *g_dev = NULL;
+static demodulator_t g_demod;
 
-// AIS
 static ais_ctx_t g_ais;
+static adbs_ctx_t g_adbs;
 
-// Voice
-static voice_ctx_t g_voice;
-
+typedef struct {
+    const char *name;
+    void *ctx;
+    void (*init)(void *ctx, const demod_config_t *cfg);
+    void (*fill_demod_config)(demod_config_t *cfg);
+    demod_output_t (*get_demod_output)(void *ctx);
+    void (*flush)(void *ctx);
+    void (*run_test)(void *ctx);
+} module_ops_t;
 
 static void on_sigint(int sig) {
     (void)sig;
@@ -60,7 +39,7 @@ static void on_sigint(int sig) {
     if (g_dev) rtlsdr_cancel_async(g_dev);
 }
 
-static int streq_icase(const char* a, const char* b) {
+static int streq_icase(const char *a, const char *b) {
     if (!a || !b) return 0;
     while (*a && *b) {
         if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) return 0;
@@ -70,267 +49,128 @@ static int streq_icase(const char* a, const char* b) {
     return *a == '\0' && *b == '\0';
 }
 
-// Simple ring buffer for float mono audio
-typedef struct {
-    float buf[RING_SIZE];
-    uint32_t w; // write index
-    uint32_t r; // read index
-} ring_t;
-
-static ring_t g_ring;
-
-// Push N samples into ring (drops oldest if overflow)
-static inline void ring_push(const float* x, uint32_t n) {
-    for (uint32_t i = 0; i < n; i++) {
-        g_ring.buf[g_ring.w] = x[i];
-        g_ring.w = (g_ring.w + 1) % RING_SIZE;
-        // overflow: move read forward
-        if (g_ring.w == g_ring.r) {
-            g_ring.r = (g_ring.r + 1) % RING_SIZE;
-        }
+static const char *demod_kind_name(demod_kind_t kind) {
+    switch (kind) {
+    case DEMOD_KIND_AM:
+        return "am";
+    case DEMOD_KIND_GMSK:
+        return "gmsk";
+    case DEMOD_KIND_NONE:
+    default:
+        return "none";
     }
 }
 
-// Pop N samples; if not enough, pad with zeros
-static inline void ring_pop(float* out, uint32_t n) {
-    for (uint32_t i = 0; i < n; i++) {
-        if (g_ring.r == g_ring.w) {
-            out[i] = 0.0f;
-        } else {
-            out[i] = g_ring.buf[g_ring.r];
-            g_ring.r = (g_ring.r + 1) % RING_SIZE;
-        }
-    }
+static void rtlsdr_cb(unsigned char *buf, uint32_t len, void *ctx) {
+    (void)ctx;
+    if (g_stop) return;
+    demodulator_process_raw_iq_u8(&g_demod, buf, len);
 }
 
-// FM demod helper: angle of complex product
-static inline float fm_discriminator(float i, float q, float i_prev, float q_prev) {
-    // prod = (i + jq) * conj(i_prev + jq_prev) = (i + jq) * (i_prev - jq_prev)
-    float re = i * i_prev + q * q_prev;
-    float im = q * i_prev - i * q_prev;
-    return atan2f(im, re);
+static void ais_init_module(void *ctx, const demod_config_t *cfg) {
+    (void)cfg;
+    ais_init((ais_ctx_t *)ctx);
 }
 
-// --------- PortAudio callback ----------
-static int pa_cb(const void* input, void* output,
-                 unsigned long frameCount,
-                 const PaStreamCallbackTimeInfo* timeInfo,
-                 PaStreamCallbackFlags statusFlags,
-                 void* userData) {
-    (void)input; (void)timeInfo; (void)statusFlags; (void)userData;
-    float* out = (float*)output;
-    ring_pop(out, (uint32_t)frameCount);
-    return g_stop ? paComplete : paContinue;
+static demod_output_t ais_get_demod_output_module(void *ctx) {
+    return ais_get_demod_output((ais_ctx_t *)ctx);
 }
 
-// --------- RTL-SDR async callback (producer) ----------
-typedef struct {
-    // Decim1 accumulators
-    int acc1_count;
-    int32_t acc1_i;
-    int32_t acc1_q;
+static void ais_flush_module(void *ctx) {
+    ais_flush((ais_ctx_t *)ctx);
+}
 
-    // Decim2 accumulators (voice stage)
-    int acc2_count;
-    float acc2;
+static void ais_run_test_module(void *ctx) {
+    (void)ctx;
+    ais_test_emit_example();
+}
 
-    // Decim for AIS (complex)
-    int acc_ais_count;
-    float acc_ais_i;
-    float acc_ais_q;
+static void adbs_init_module(void *ctx, const demod_config_t *cfg) {
+    adbs_init((adbs_ctx_t *)ctx, cfg ? cfg->output_fs : 0);
+}
 
-    // FM demod previous IQ (at FS1)
-    float i_prev;
-    float q_prev;
-    int have_prev;
+static demod_output_t adbs_get_demod_output_module(void *ctx) {
+    return adbs_get_demod_output((adbs_ctx_t *)ctx);
+}
 
-} dsp_state_t;
+static void adbs_flush_module(void *ctx) {
+    adbs_flush((adbs_ctx_t *)ctx);
+}
 
-static dsp_state_t g_dsp;
+static void adbs_run_test_module(void *ctx) {
+    adbs_test_emit_example((adbs_ctx_t *)ctx);
+}
 
-// --------- Decoder interface ----------
-typedef struct {
-    const char* name;
-    int needs_audio; // 1 = uses PortAudio output
-    int fs_demod;
-    void (*init)(int fs_demod);
-    void (*process_fm)(float sample);
-    void (*process_iq)(float i, float q);
-    void (*flush)(void);
-} decoder_ops_t;
-
-static void voice_init_decoder(int fs_demod);
-static void voice_process_sample_decoder(float sample);
-static void voice_flush_decoder(void);
-static void ais_init_decoder(int fs_demod);
-static void ais_process_sample_iq_decoder(float i, float q);
-static void ais_flush_decoder(void);
-
-// Add new decoders here.
-static const decoder_ops_t g_decoders[] = {
-    { "voice", 1, VOICE_FS, voice_init_decoder, voice_process_sample_decoder, NULL,                    voice_flush_decoder },
-    { "ais",   0, AIS_FS,   ais_init_decoder,   NULL,                         ais_process_sample_iq_decoder,  ais_flush_decoder },
-    { NULL,    0, 0,        NULL,               NULL,                         NULL,                    NULL }
+static const module_ops_t g_modules[] = {
+    { "ais",  &g_ais,  ais_init_module,  ais_get_demod_config,  ais_get_demod_output_module,  ais_flush_module,  ais_run_test_module  },
+    { "adbs", &g_adbs, adbs_init_module, adbs_get_demod_config, adbs_get_demod_output_module, adbs_flush_module, adbs_run_test_module },
+    { NULL,   NULL,    NULL,             NULL,                   NULL,                          NULL,              NULL                 }
 };
 
-static const decoder_ops_t* g_decoder = NULL;
-
-static const decoder_ops_t* find_decoder(const char* name) {
+static const module_ops_t *find_module(const char *name) {
     if (!name) return NULL;
-    if (streq_icase(name, "voce")) name = "voice";
-    for (int i = 0; g_decoders[i].name; i++) {
-        if (streq_icase(name, g_decoders[i].name)) return &g_decoders[i];
+    if (streq_icase(name, "adsb") || streq_icase(name, "adb-s")) name = "adbs";
+    for (int i = 0; g_modules[i].name; i++) {
+        if (streq_icase(name, g_modules[i].name)) return &g_modules[i];
     }
     return NULL;
 }
 
-static void rtlsdr_cb(unsigned char* buf, uint32_t len, void* ctx) {
-    (void)ctx;
-    if (g_stop) return;
-
-    // buf contains interleaved unsigned I/Q bytes: I0 Q0 I1 Q1 ...
-    // Convert to signed centered around 0: (byte - 127.5)
-    // We do boxcar decimations to reduce rate and CPU.
-
-    for (uint32_t p = 0; p + 1 < len; p += 2) {
-        int32_t i = (int32_t)buf[p]   - 127;
-        int32_t q = (int32_t)buf[p+1] - 127;
-
-        // --- Decim1: 2.4M -> 480k by averaging 5 samples ---
-        g_dsp.acc1_i += i;
-        g_dsp.acc1_q += q;
-        g_dsp.acc1_count++;
-
-        if (g_dsp.acc1_count == DECIM1) {
-            float I1 = (float)g_dsp.acc1_i / (float)DECIM1;
-            float Q1 = (float)g_dsp.acc1_q / (float)DECIM1;
-
-            g_dsp.acc1_i = 0;
-            g_dsp.acc1_q = 0;
-            g_dsp.acc1_count = 0;
-
-            if (g_decoder && g_decoder->process_iq) {
-                // --- AIS path: complex decim 480k -> 96k ---
-                g_dsp.acc_ais_i += I1;
-                g_dsp.acc_ais_q += Q1;
-                g_dsp.acc_ais_count++;
-                if (g_dsp.acc_ais_count == DECIM_AIS) {
-                    float I2 = g_dsp.acc_ais_i / (float)DECIM_AIS;
-                    float Q2 = g_dsp.acc_ais_q / (float)DECIM_AIS;
-                    g_dsp.acc_ais_i = 0.0f;
-                    g_dsp.acc_ais_q = 0.0f;
-                    g_dsp.acc_ais_count = 0;
-                    g_decoder->process_iq(I2, Q2);
-                }
-            } else {
-                // --- Voice path: FM demod at 480k ---
-                float dem;
-                if (!g_dsp.have_prev) {
-                    g_dsp.i_prev = I1;
-                    g_dsp.q_prev = Q1;
-                    g_dsp.have_prev = 1;
-                    continue;
-                }
-                dem = fm_discriminator(I1, Q1, g_dsp.i_prev, g_dsp.q_prev);
-                g_dsp.i_prev = I1;
-                g_dsp.q_prev = Q1;
-
-                // --- Decim2: 480k -> 240k (average 2 demod samples) ---
-                g_dsp.acc2 += dem;
-                g_dsp.acc2_count++;
-
-                if (g_dsp.acc2_count == DECIM2) {
-                    float a = g_dsp.acc2 / (float)DECIM2;
-                    g_dsp.acc2 = 0.0f;
-                    g_dsp.acc2_count = 0;
-                    if (g_decoder && g_decoder->process_fm) {
-                        g_decoder->process_fm(a);
-                    }
-                }
-            }
-        }
-    }
-}
-
-// --------- Decoder implementations ----------
-static void voice_ring_output(void* user, const float* samples, uint32_t n) {
-    (void)user;
-    ring_push(samples, n);
-}
-
-static void voice_init_decoder(int fs_demod) {
-    voice_decoder_init(&g_voice, fs_demod, voice_ring_output, NULL);
-}
-
-static void voice_process_sample_decoder(float sample) {
-    voice_decoder_process_sample(&g_voice, sample);
-}
-
-static void voice_flush_decoder(void) {
-    voice_decoder_flush(&g_voice);
-}
-
-static void ais_init_decoder(int fs_demod) {
-    ais_init(&g_ais, fs_demod);
-}
-
-static void ais_process_sample_iq_decoder(float i, float q) {
-    ais_process_sample_iq(&g_ais, i, q);
-}
-
-static void ais_flush_decoder(void) {
-    ais_flush(&g_ais);
-}
-
-static void usage(const char* prog) {
+static void usage(const char *prog) {
     fprintf(stderr, "Usage: %s <freq_mhz> [gain_db] [mode]\n", prog);
-    fprintf(stderr, "       %s <freq_mhz> [gain_db] --mode <voice|ais>\n", prog);
+    fprintf(stderr, "       %s <freq_mhz> [gain_db] --mode <ais|adbs>\n", prog);
     fprintf(stderr, "       %s <freq_mhz> --mode ais --ais-test\n", prog);
+    fprintf(stderr, "       %s <freq_mhz> --mode adbs --adbs-test\n", prog);
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  --ppm <int>   frequency correction (e.g. -20, +35)\n");
     fprintf(stderr, "  --bw  <hz>    tuner bandwidth (Hz), 0=auto\n");
-    fprintf(stderr, "Example: %s 100.0 20 voice\n", prog);
-    fprintf(stderr, "         %s 162.0 --mode ais\n", prog);
+    fprintf(stderr, "Example: %s 162.025 --mode ais --ppm -20 --bw 25000\n", prog);
+    fprintf(stderr, "         %s 1090.0 --mode adbs\n", prog);
 }
 
-static int parse_int_arg(const char* s, int* out) {
-    char* end = NULL;
+static int parse_int_arg(const char *s, int *out) {
+    char *end = NULL;
     long v = strtol(s, &end, 10);
     if (s == end || *end != '\0') return 0;
     *out = (int)v;
     return 1;
 }
 
-int main(int argc, char** argv) {
+int main(int argc, char **argv) {
     signal(SIGINT, on_sigint);
-    char* freq_opt = argv[1];
 
     if (argc < 2) {
         usage(argv[0]);
         return 1;
     }
 
-    const char* decoder_name = "voice";
+    const char *freq_opt = argv[1];
+    const char *module_name = "ais";
     int gain = 0;
     int use_manual_gain = 0;
     int ais_test = 0;
+    int adbs_test = 0;
     int ppm = 0;
     int have_ppm = 0;
     uint32_t tuner_bw = 0;
 
     for (int i = 2; i < argc; i++) {
-        const char* arg = argv[i];
+        const char *arg = argv[i];
         if (strcmp(arg, "--mode") == 0 || strcmp(arg, "--decoder") == 0) {
             if (i + 1 >= argc) {
                 fprintf(stderr, "Missing value for %s\n", arg);
                 usage(argv[0]);
                 return 1;
             }
-            decoder_name = argv[++i];
+            module_name = argv[++i];
             continue;
         }
         if (strcmp(arg, "--ais-test") == 0) {
             ais_test = 1;
+            continue;
+        }
+        if (strcmp(arg, "--adbs-test") == 0) {
+            adbs_test = 1;
             continue;
         }
         if (strcmp(arg, "--ppm") == 0) {
@@ -339,22 +179,20 @@ int main(int argc, char** argv) {
                 usage(argv[0]);
                 return 1;
             }
-            int parsed_ppm = 0;
-            if (!parse_int_arg(argv[++i], &parsed_ppm)) {
+            if (!parse_int_arg(argv[++i], &ppm)) {
                 fprintf(stderr, "Invalid value for --ppm\n");
                 return 1;
             }
-            ppm = parsed_ppm;
             have_ppm = 1;
             continue;
         }
         if (strcmp(arg, "--bw") == 0) {
+            int parsed_bw = 0;
             if (i + 1 >= argc) {
                 fprintf(stderr, "Missing value for %s\n", arg);
                 usage(argv[0]);
                 return 1;
             }
-            int parsed_bw = 0;
             if (!parse_int_arg(argv[++i], &parsed_bw) || parsed_bw < 0) {
                 fprintf(stderr, "Invalid value for --bw\n");
                 return 1;
@@ -362,9 +200,9 @@ int main(int argc, char** argv) {
             tuner_bw = (uint32_t)parsed_bw;
             continue;
         }
-      
-        if (streq_icase(arg, "voice") || streq_icase(arg, "voce") || streq_icase(arg, "ais")) {
-            decoder_name = arg;
+        if (streq_icase(arg, "ais") || streq_icase(arg, "adbs")
+            || streq_icase(arg, "adsb") || streq_icase(arg, "adb-s")) {
+            module_name = arg;
             continue;
         }
         if (!use_manual_gain) {
@@ -380,38 +218,68 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    g_decoder = find_decoder(decoder_name);
-    if (!g_decoder) {
-        fprintf(stderr, "Unknown mode/decoder: %s\n", decoder_name);
+    const module_ops_t *module = find_module(module_name);
+    if (!module) {
+        fprintf(stderr, "Unknown mode/module: %s\n", module_name);
         usage(argv[0]);
+        return 1;
+    }
+
+    demod_config_t demod_cfg;
+    memset(&demod_cfg, 0, sizeof(demod_cfg));
+    module->fill_demod_config(&demod_cfg);
+    if (demod_cfg.kind == DEMOD_KIND_NONE || demod_cfg.input_fs <= 0 || demod_cfg.output_fs <= 0) {
+        fprintf(stderr, "Invalid demodulator config for mode=%s\n", module->name);
+        return 1;
+    }
+
+    module->init(module->ctx, &demod_cfg);
+
+    if (ais_test) {
+        if (!streq_icase(module->name, "ais")) {
+            fprintf(stderr, "--ais-test works only with mode=ais\n");
+            module->flush(module->ctx);
+            return 1;
+        }
+        module->run_test(module->ctx);
+        module->flush(module->ctx);
+        return 0;
+    }
+
+    if (adbs_test) {
+        if (!streq_icase(module->name, "adbs")) {
+            fprintf(stderr, "--adbs-test works only with mode=adbs\n");
+            module->flush(module->ctx);
+            return 1;
+        }
+        module->run_test(module->ctx);
+        module->flush(module->ctx);
+        return 0;
+    }
+
+    demod_output_t demod_output = module->get_demod_output(module->ctx);
+    if (!demodulator_init(&g_demod, &demod_cfg, &demod_output)) {
+        fprintf(stderr, "Failed to initialize demodulator=%s for mode=%s\n",
+                demod_kind_name(demod_cfg.kind), module->name);
+        module->flush(module->ctx);
         return 1;
     }
 
     double freq_mhz = atof(freq_opt);
     if (freq_mhz < 10.0) {
         fprintf(stderr, "Invalid frequency.\n");
+        demodulator_flush(&g_demod);
+        module->flush(module->ctx);
         return 1;
     }
     uint32_t freq_hz = (uint32_t)(freq_mhz * 1e6);
 
-    memset(&g_ring, 0, sizeof(g_ring));
-    memset(&g_dsp, 0, sizeof(g_dsp));
-    if (g_decoder->init) g_decoder->init(g_decoder->fs_demod);
-
-    if (ais_test) {
-        if (streq_icase(g_decoder->name, "ais")) {
-            ais_test_emit_example();
-            return 0;
-        }
-        fprintf(stderr, "--ais-test works only with mode=ais\n");
-        return 1;
-    }
-
-    // ---- init RTL-SDR ----
-    rtlsdr_dev_t* dev = NULL;
+    rtlsdr_dev_t *dev = NULL;
     int r = rtlsdr_open(&dev, 0);
     if (r < 0) {
         fprintf(stderr, "rtlsdr_open failed\n");
+        demodulator_flush(&g_demod);
+        module->flush(module->ctx);
         return 1;
     }
     g_dev = dev;
@@ -423,12 +291,13 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Set sample rate + center frequency
-    r = rtlsdr_set_sample_rate(dev, SDR_FS);
+    r = rtlsdr_set_sample_rate(dev, (uint32_t)demod_cfg.input_fs);
     if (r < 0) {
         fprintf(stderr, "rtlsdr_set_sample_rate failed (%d)\n", r);
         g_dev = NULL;
         rtlsdr_close(dev);
+        demodulator_flush(&g_demod);
+        module->flush(module->ctx);
         return 1;
     }
 
@@ -444,88 +313,38 @@ int main(int argc, char** argv) {
         fprintf(stderr, "rtlsdr_set_center_freq failed (%d)\n", r);
         g_dev = NULL;
         rtlsdr_close(dev);
+        demodulator_flush(&g_demod);
+        module->flush(module->ctx);
         return 1;
     }
 
-    // Gain
     if (use_manual_gain) {
-        // RTL-SDR expects tenths of dB
         rtlsdr_set_tuner_gain_mode(dev, 1);
         rtlsdr_set_tuner_gain(dev, gain * 10);
     } else {
-        rtlsdr_set_tuner_gain_mode(dev, 0); // auto
+        rtlsdr_set_tuner_gain_mode(dev, 0);
     }
 
-    // Reset buffer
     rtlsdr_reset_buffer(dev);
 
     char gain_desc[32];
-    if (use_manual_gain) {
-        snprintf(gain_desc, sizeof(gain_desc), "%d dB", gain);
-    } else {
-        snprintf(gain_desc, sizeof(gain_desc), "auto");
-    }
+    if (use_manual_gain) snprintf(gain_desc, sizeof(gain_desc), "%d dB", gain);
+    else snprintf(gain_desc, sizeof(gain_desc), "auto");
 
-    printf("START WFM C (async)\n");
-    printf("  freq=%.3f MHz | sdr_fs=%d | demod_fs=%d | gain=%s | mode=%s",
-           freq_mhz, SDR_FS, g_decoder->fs_demod, gain_desc, g_decoder->name);
+    printf("START RX C (async)\n");
+    printf("  freq=%.3f MHz | raw_fs=%d | demod=%s | demod_fs=%d | gain=%s | mode=%s",
+           freq_mhz, demod_cfg.input_fs, demod_kind_name(demod_cfg.kind),
+           demod_cfg.output_fs, gain_desc, module->name);
     if (have_ppm) printf(" | ppm=%d", ppm);
     if (tuner_bw) printf(" | bw=%u", tuner_bw);
     printf("\n");
     printf("  Ctrl+C to stop\n");
 
-    PaStream* stream = NULL;
-    PaError pe = paNoError;
-    if (g_decoder->needs_audio) {
-        // ---- init PortAudio ----
-        pe = Pa_Initialize();
-        if (pe != paNoError) {
-            fprintf(stderr, "Pa_Initialize error: %s\n", Pa_GetErrorText(pe));
-            g_dev = NULL;
-            rtlsdr_close(dev);
-            return 1;
-        }
-
-        pe = Pa_OpenDefaultStream(&stream,
-                                  0,          // no input
-                                  1,          // mono output
-                                  paFloat32,  // float32 output
-                                  VOICE_FS,
-                                  1024,       // frames per buffer
-                                  pa_cb,
-                                  NULL);
-        if (pe != paNoError) {
-            fprintf(stderr, "Pa_OpenDefaultStream error: %s\n", Pa_GetErrorText(pe));
-            Pa_Terminate();
-            g_dev = NULL;
-            rtlsdr_close(dev);
-            return 1;
-        }
-
-        pe = Pa_StartStream(stream);
-        if (pe != paNoError) {
-            fprintf(stderr, "Pa_StartStream error: %s\n", Pa_GetErrorText(pe));
-            Pa_CloseStream(stream);
-            Pa_Terminate();
-            g_dev = NULL;
-            rtlsdr_close(dev);
-            return 1;
-        }
-    }
-
-    // ---- start async RTL read (blocking call) ----
-    // Buffer length chosen moderate; librtlsdr will manage streaming.
-    // This will return when rtlsdr_cancel_async is called or error occurs.
     r = rtlsdr_read_async(dev, rtlsdr_cb, NULL, 0, 0);
 
-    // Cleanup
     g_stop = 1;
-    if (g_decoder && g_decoder->flush) g_decoder->flush();
-    if (g_decoder->needs_audio) {
-        Pa_StopStream(stream);
-        Pa_CloseStream(stream);
-        Pa_Terminate();
-    }
+    demodulator_flush(&g_demod);
+    module->flush(module->ctx);
 
     g_dev = NULL;
     rtlsdr_close(dev);

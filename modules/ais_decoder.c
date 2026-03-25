@@ -2,8 +2,6 @@
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
-#include <stdlib.h>
-#include <complex.h>
 #include <ctype.h>
 
 // ---- CRC-16 (HDLC/PPP style, reflected 0x1021 -> 0x8408) ----
@@ -379,55 +377,41 @@ static void hdlc_push_bit(ais_ctx_t *ctx, int bit) {
     buf_push_bit_lsb(ctx, decoded);
 }
 
-void ais_init(ais_ctx_t *ctx, int fs_demod) {
-    memset(ctx, 0, sizeof(*ctx));
-    ctx->k = (unsigned int)(fs_demod / 9600);
-    if (ctx->k < 2) ctx->k = 2;
-    if ((fs_demod % 9600) != 0) {
-        fprintf(stderr, "[AIS] warning: fs_demod=%d not multiple of 9600, k=%u\n",
-                fs_demod, ctx->k);
-    }
-
-    ctx->m = 3;
-    ctx->bt = 0.4f;
-    ctx->demod = gmskdem_create(ctx->k, ctx->m, ctx->bt);
-    if (!ctx->demod) {
-        fprintf(stderr, "[AIS] gmskdem_create failed\n");
-        return;
-    }
-
-    ctx->sym_buf = (liquid_float_complex*)calloc(ctx->k, sizeof(liquid_float_complex));
-    if (!ctx->sym_buf) {
-        fprintf(stderr, "[AIS] sym_buf alloc failed\n");
-        gmskdem_destroy(ctx->demod);
-        ctx->demod = NULL;
-        return;
-    }
-    ctx->sym_idx = 0;
+static void ais_on_demod_bit_cb(void *user, uint8_t bit) {
+    if (!user) return;
+    ais_process_demod_bit((ais_ctx_t *)user, bit);
 }
 
-void ais_process_sample_iq(ais_ctx_t *ctx, float i, float q) {
-    if (!ctx || !ctx->demod || !ctx->sym_buf) return;
-    ctx->sym_buf[ctx->sym_idx++] = i + _Complex_I * q;
-    if (ctx->sym_idx >= ctx->k) {
-        unsigned int sym = 0;
-        gmskdem_demodulate(ctx->demod, ctx->sym_buf, &sym);
-        hdlc_push_bit(ctx, (int)(sym & 1u));
-        ctx->sym_idx = 0;
-    }
+void ais_init(ais_ctx_t *ctx) {
+    memset(ctx, 0, sizeof(*ctx));
+}
+
+void ais_get_demod_config(demod_config_t *cfg) {
+    if (!cfg) return;
+    memset(cfg, 0, sizeof(*cfg));
+    cfg->kind = DEMOD_KIND_GMSK;
+    cfg->input_fs = 2400000;
+    cfg->output_fs = 96000;
+    cfg->u.gmsk.symbol_rate = 9600;
+    cfg->u.gmsk.m = 3;
+    cfg->u.gmsk.bt = 0.4f;
+}
+
+demod_output_t ais_get_demod_output(ais_ctx_t *ctx) {
+    demod_output_t out;
+    memset(&out, 0, sizeof(out));
+    out.on_bit = ais_on_demod_bit_cb;
+    out.user = ctx;
+    return out;
+}
+
+void ais_process_demod_bit(ais_ctx_t *ctx, uint8_t bit) {
+    if (!ctx) return;
+    hdlc_push_bit(ctx, (int)(bit & 1u));
 }
 
 void ais_flush(ais_ctx_t *ctx) {
-    if (!ctx) return;
-    if (ctx->demod) {
-        gmskdem_destroy(ctx->demod);
-        ctx->demod = NULL;
-    }
-    if (ctx->sym_buf) {
-        free(ctx->sym_buf);
-        ctx->sym_buf = NULL;
-    }
-    ctx->sym_idx = 0;
+    (void)ctx;
 }
 
 // Default callback: stampa solo lunghezza frame.

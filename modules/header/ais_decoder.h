@@ -1,21 +1,14 @@
 #pragma once
 #include <stdint.h>
 #include <stddef.h>
-#include <liquid/liquid.h>
+
+#include "demodulator.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 typedef struct {
-    // --- GMSK demod ---
-    gmskdem demod;
-    unsigned int k;       // samples per symbol
-    unsigned int m;       // filter delay (symbols)
-    float bt;             // Gaussian BT
-    unsigned int sym_idx;
-    liquid_float_complex* sym_buf;
-
     // --- HDLC/AIS state ---
     uint32_t shift_reg;   // per cercare 0x7E
     int in_frame;
@@ -36,11 +29,10 @@ typedef struct {
 
 } ais_ctx_t;
 
-// init con sample rate baseband complesso (es. 96000)
-void ais_init(ais_ctx_t *ctx, int fs_demod);
-
-// feed: campioni IQ baseband (float)
-void ais_process_sample_iq(ais_ctx_t *ctx, float i, float q);
+void ais_init(ais_ctx_t *ctx);
+void ais_get_demod_config(demod_config_t *cfg);
+demod_output_t ais_get_demod_output(ais_ctx_t *ctx);
+void ais_process_demod_bit(ais_ctx_t *ctx, uint8_t bit);
 
 // flush/cleanup
 void ais_flush(ais_ctx_t *ctx);
