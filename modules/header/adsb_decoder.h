@@ -61,9 +61,6 @@ void adsb_feed_clean_bit(adsb_ctx_t *ctx, uint8_t bit);
 // Feed a vector of already-demodulated bits (each element 0/1).
 void adsb_feed_clean_bits(adsb_ctx_t *ctx, const uint8_t *bits, size_t nbits);
 
-// Test helper: emits one synthetic ADS-B long frame through clean-bit path.
-void adsb_test_emit_example(adsb_ctx_t *ctx);
-
 // Default conversion hook called for each assembled clean frame.
 // Edit/replace this logic to map bits to your protocol structures.
 void adsb_on_clean_frame(const uint8_t *frame, size_t frame_bits);

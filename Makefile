@@ -1,10 +1,10 @@
 CC = cc
-CFLAGS = -O2 -std=c11 -I/opt/homebrew/include -Idemod/header
+CFLAGS = -O2 -std=c11 -I/opt/homebrew/include -Idemod/header -Iutility
 LDFLAGS = -L/opt/homebrew/lib
 LDLIBS = -lrtlsdr -lliquid -lportaudio -lusb-1.0 -lm
 
 TARGET = rtl-universal
-SRC = rtl-universal.c $(wildcard modules/*.c) $(wildcard demod/*.c)
+SRC = rtl-universal.c $(wildcard modules/*.c) $(wildcard demod/*.c) $(wildcard utility/*.c)
 
 .PHONY: clean
 

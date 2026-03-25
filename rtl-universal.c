@@ -129,14 +129,11 @@ static void adsb_flush_module(void *ctx) {
     adsb_flush((adsb_ctx_t *)ctx);
 }
 
-static void adsb_run_test_module(void *ctx) {
-    adsb_test_emit_example((adsb_ctx_t *)ctx);
-}
 
 static const module_ops_t g_modules[] = {
     { "voice", &g_voice, voice_init_module, voice_fill_demod_config_module, voice_get_demod_output_module, voice_flush_module, NULL                 },
     { "ais",   &g_ais,   ais_init_module,   ais_fill_demod_config_module,   ais_get_demod_output_module,   ais_flush_module,   ais_run_test_module  },
-    { "adsb",  &g_adsb,  adsb_init_module,  adsb_fill_demod_config_module,  adsb_get_demod_output_module,  adsb_flush_module,  adsb_run_test_module },
+    { "adsb",  &g_adsb,  adsb_init_module,  adsb_fill_demod_config_module,  adsb_get_demod_output_module,  adsb_flush_module,  NULL },
     { NULL,    NULL,     NULL,              NULL,                            NULL,                           NULL,               NULL                 }
 };
 
@@ -155,7 +152,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "       %s <freq_mhz> [gain_db] --mode <voice|ais|adsb>\n", prog);
     fprintf(stderr, "       %s <freq_mhz> --mode voice [--demod <fm|am>]\n", prog);
     fprintf(stderr, "       %s <freq_mhz> --mode ais --ais-test\n", prog);
-    fprintf(stderr, "       %s <freq_mhz> --mode adsb --adsb-test\n", prog);
+    fprintf(stderr, "       %s <freq_mhz> --mode adsb\n", prog);
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  --ppm <int>   frequency correction (e.g. -20, +35)\n");
     fprintf(stderr, "  --bw  <hz>    tuner bandwidth (Hz), 0=auto\n");
@@ -188,7 +185,6 @@ int main(int argc, char **argv) {
     int gain = 0;
     int use_manual_gain = 0;
     int ais_test = 0;
-    int adsb_test = 0;
     int ppm = 0;
     int have_ppm = 0;
     uint32_t tuner_bw = 0;
@@ -207,10 +203,6 @@ int main(int argc, char **argv) {
         }
         if (strcmp(arg, "--ais-test") == 0) {
             ais_test = 1;
-            continue;
-        }
-        if (strcmp(arg, "--adsb-test") == 0) {
-            adsb_test = 1;
             continue;
         }
         if (strcmp(arg, "--ppm") == 0) {
@@ -304,17 +296,6 @@ int main(int argc, char **argv) {
     if (ais_test) {
         if (!streq_icase(module->name, "ais")) {
             fprintf(stderr, "--ais-test works only with mode=ais\n");
-            module->flush(module->ctx);
-            return 1;
-        }
-        module->run_test(module->ctx);
-        module->flush(module->ctx);
-        return 0;
-    }
-
-    if (adsb_test) {
-        if (!streq_icase(module->name, "adsb")) {
-            fprintf(stderr, "--adsb-test works only with mode=adsb\n");
             module->flush(module->ctx);
             return 1;
         }
