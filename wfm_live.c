@@ -13,7 +13,7 @@
 #include <rtl-sdr.h>
 
 #include "modules/header/ais_decoder.h"
-#include "modules/header/adbs_decoder.h"
+#include "modules/header/adsb_decoder.h"
 #include "demod/header/demodulator.h"
 
 static volatile int g_stop = 0;
@@ -21,7 +21,7 @@ static rtlsdr_dev_t *g_dev = NULL;
 static demodulator_t g_demod;
 
 static ais_ctx_t g_ais;
-static adbs_ctx_t g_adbs;
+static adsb_ctx_t g_adsb;
 
 typedef struct {
     const char *name;
@@ -85,31 +85,31 @@ static void ais_run_test_module(void *ctx) {
     ais_test_emit_example();
 }
 
-static void adbs_init_module(void *ctx, const demod_config_t *cfg) {
-    adbs_init((adbs_ctx_t *)ctx, cfg ? cfg->output_fs : 0);
+static void adsb_init_module(void *ctx, const demod_config_t *cfg) {
+    adsb_init((adsb_ctx_t *)ctx, cfg ? cfg->output_fs : 0);
 }
 
-static demod_output_t adbs_get_demod_output_module(void *ctx) {
-    return adbs_get_demod_output((adbs_ctx_t *)ctx);
+static demod_output_t adsb_get_demod_output_module(void *ctx) {
+    return adsb_get_demod_output((adsb_ctx_t *)ctx);
 }
 
-static void adbs_flush_module(void *ctx) {
-    adbs_flush((adbs_ctx_t *)ctx);
+static void adsb_flush_module(void *ctx) {
+    adsb_flush((adsb_ctx_t *)ctx);
 }
 
-static void adbs_run_test_module(void *ctx) {
-    adbs_test_emit_example((adbs_ctx_t *)ctx);
+static void adsb_run_test_module(void *ctx) {
+    adsb_test_emit_example((adsb_ctx_t *)ctx);
 }
 
 static const module_ops_t g_modules[] = {
     { "ais",  &g_ais,  ais_init_module,  ais_get_demod_config,  ais_get_demod_output_module,  ais_flush_module,  ais_run_test_module  },
-    { "adbs", &g_adbs, adbs_init_module, adbs_get_demod_config, adbs_get_demod_output_module, adbs_flush_module, adbs_run_test_module },
+    { "adsb", &g_adsb, adsb_init_module, adsb_get_demod_config, adsb_get_demod_output_module, adsb_flush_module, adsb_run_test_module },
     { NULL,   NULL,    NULL,             NULL,                   NULL,                          NULL,              NULL                 }
 };
 
 static const module_ops_t *find_module(const char *name) {
     if (!name) return NULL;
-    if (streq_icase(name, "adsb") || streq_icase(name, "adb-s")) name = "adbs";
+    if (streq_icase(name, "adsb") || streq_icase(name, "adb-s")) name = "adsb";
     for (int i = 0; g_modules[i].name; i++) {
         if (streq_icase(name, g_modules[i].name)) return &g_modules[i];
     }
@@ -118,14 +118,14 @@ static const module_ops_t *find_module(const char *name) {
 
 static void usage(const char *prog) {
     fprintf(stderr, "Usage: %s <freq_mhz> [gain_db] [mode]\n", prog);
-    fprintf(stderr, "       %s <freq_mhz> [gain_db] --mode <ais|adbs>\n", prog);
+    fprintf(stderr, "       %s <freq_mhz> [gain_db] --mode <ais|adsb>\n", prog);
     fprintf(stderr, "       %s <freq_mhz> --mode ais --ais-test\n", prog);
-    fprintf(stderr, "       %s <freq_mhz> --mode adbs --adbs-test\n", prog);
+    fprintf(stderr, "       %s <freq_mhz> --mode adsb --adsb-test\n", prog);
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  --ppm <int>   frequency correction (e.g. -20, +35)\n");
     fprintf(stderr, "  --bw  <hz>    tuner bandwidth (Hz), 0=auto\n");
     fprintf(stderr, "Example: %s 162.025 --mode ais --ppm -20 --bw 25000\n", prog);
-    fprintf(stderr, "         %s 1090.0 --mode adbs\n", prog);
+    fprintf(stderr, "         %s 1090.0 --mode adsb\n", prog);
 }
 
 static int parse_int_arg(const char *s, int *out) {
@@ -149,7 +149,7 @@ int main(int argc, char **argv) {
     int gain = 0;
     int use_manual_gain = 0;
     int ais_test = 0;
-    int adbs_test = 0;
+    int adsb_test = 0;
     int ppm = 0;
     int have_ppm = 0;
     uint32_t tuner_bw = 0;
@@ -169,8 +169,8 @@ int main(int argc, char **argv) {
             ais_test = 1;
             continue;
         }
-        if (strcmp(arg, "--adbs-test") == 0) {
-            adbs_test = 1;
+        if (strcmp(arg, "--adsb-test") == 0) {
+            adsb_test = 1;
             continue;
         }
         if (strcmp(arg, "--ppm") == 0) {
@@ -200,7 +200,7 @@ int main(int argc, char **argv) {
             tuner_bw = (uint32_t)parsed_bw;
             continue;
         }
-        if (streq_icase(arg, "ais") || streq_icase(arg, "adbs")
+        if (streq_icase(arg, "ais") || streq_icase(arg, "adsb")
             || streq_icase(arg, "adsb") || streq_icase(arg, "adb-s")) {
             module_name = arg;
             continue;
@@ -246,9 +246,9 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    if (adbs_test) {
-        if (!streq_icase(module->name, "adbs")) {
-            fprintf(stderr, "--adbs-test works only with mode=adbs\n");
+    if (adsb_test) {
+        if (!streq_icase(module->name, "adsb")) {
+            fprintf(stderr, "--adsb-test works only with mode=adsb\n");
             module->flush(module->ctx);
             return 1;
         }
