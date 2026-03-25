@@ -1,4 +1,0 @@
-readsb --device-type rtlsdr --net \
-  --write-json ~/tar1090/html/data --write-json-every 1 \
-  --gain 38
-

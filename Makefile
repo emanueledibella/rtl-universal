@@ -4,22 +4,17 @@ LDFLAGS = -L/opt/homebrew/lib
 LDLIBS = -lrtlsdr -lliquid -lportaudio -lusb-1.0 -lm
 
 SRC = wfm_live.c $(wildcard modules/*.c) $(wildcard demod/*.c)
-OBJ = antenna.o
+BUILD_DIR = build
+OBJ = $(patsubst %.c,$(BUILD_DIR)/%.o,$(SRC))
 
 .PHONY: clean
 
 wfm_live: $(OBJ)
 	$(CC) $(OBJ) -o $@ $(LDFLAGS) $(LDLIBS)
 
-$(OBJ): $(SRC)
-	@tmpdir=$$(mktemp -d); \
-	for src in $(SRC); do \
-		obj="$$tmpdir/$$(basename "$$src" .c).o"; \
-		$(CC) $(CFLAGS) -c "$$src" -o "$$obj" || exit 1; \
-	done; \
-	$(CC) -r $$tmpdir/*.o -o $@ || exit 1; \
-	rm -rf "$$tmpdir"
+$(BUILD_DIR)/%.o: %.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
-	find . -maxdepth 2 -name '*.o' -delete
-	rm -f wfm_live
+	rm -rf $(BUILD_DIR) wfm_live
