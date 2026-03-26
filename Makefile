@@ -1,5 +1,6 @@
 CC = cc
-CFLAGS = -O2 -std=c11 -I/opt/homebrew/include -Idemod/header -Iutility
+CPPFLAGS = -isystem /opt/homebrew/include -Idemod/header -Iutility
+CFLAGS = -O2 -std=c11
 LDFLAGS = -L/opt/homebrew/lib
 LDLIBS = -lrtlsdr -lliquid -lportaudio -lusb-1.0 -lm
 
@@ -9,7 +10,7 @@ SRC = rtl-universal.c $(wildcard modules/*.c) $(wildcard demod/*.c) $(wildcard u
 .PHONY: clean
 
 $(TARGET): $(SRC)
-	$(CC) $(CFLAGS) $(SRC) -o $@ $(LDFLAGS) $(LDLIBS)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(SRC) -o $@ $(LDFLAGS) $(LDLIBS)
 
 clean:
 	rm -f $(TARGET) rtl-universal antenna.o

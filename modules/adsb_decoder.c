@@ -12,11 +12,11 @@
 #define LONG_FRAME_BITS 112u
 
 static float hist_get(const adsb_ctx_t *ctx, uint64_t sample_index) {
-    return ctx->mag_history[sample_index % adsb_MAG_HISTORY_LEN];
+    return ctx->mag_history[sample_index % MAG_HISTORY_LEN];
 }
 
 static void hist_put(adsb_ctx_t *ctx, uint64_t sample_index, float sample) {
-    ctx->mag_history[sample_index % adsb_MAG_HISTORY_LEN] = sample;
+    ctx->mag_history[sample_index % MAG_HISTORY_LEN] = sample;
 }
 
 static float max2(float a, float b) {
@@ -150,31 +150,31 @@ static void pack_bits_to_bytes_msb(const uint8_t *bits, size_t nbits, uint8_t *o
     }
 }
 
-void adsb_on_clean_frame(const uint8_t *frame, size_t frame_bits) {
+void on_clean_frame(const uint8_t *frame, size_t frame_bits) {
     size_t frame_bytes = frame_bits / 8u;
     uint32_t df;
     uint32_t ca;
 
-    printf("[adsb] frame bits=%zu bytes=%zu hex=", frame_bits, frame_bytes);
+    //printf("[adsb] frame bits=%zu bytes=%zu hex=", frame_bits, frame_bytes);
     for (size_t i = 0; i < frame_bytes; i++) {
-        printf("%02X", frame[i]);
+        //printf("%02X", frame[i]);
     }
-    printf("\n");
+    //printf("\n");
 
-    if (frame_bits < adsb_SHORT_FRAME_BITS) {
-        printf("[adsb] short/incomplete frame\n");
+    if (frame_bits < SHORT_FRAME_BITS) {
+        //printf("[adsb] short/incomplete frame\n");
         return;
     }
 
     df = bits_get_u32(frame, 0, 5);
     ca = bits_get_u32(frame, 5, 3);
 
-    if (frame_bits == adsb_LONG_FRAME_BITS) {
+    if (frame_bits == LONG_FRAME_BITS) {
         uint32_t icao = bits_get_u32(frame, 8, 24);
         uint64_t me = bits_get_u64(frame, 32, 56);
         uint32_t pi = bits_get_u32(frame, 88, 24);
-        printf("[adsb] parsed df=%u ca=%u icao=%06X me=%014llX pi=%06X\n",
-               df, ca, icao, (unsigned long long)me, pi);
+        // printf("[adsb] parsed df=%u ca=%u icao=%06X me=%014llX pi=%06X\n",
+        //        df, ca, icao, (unsigned long long)me, pi);
         protocol_handle_message((uint8_t)df, (uint8_t)ca, icao, me, pi);
 
         return;
@@ -184,8 +184,8 @@ void adsb_on_clean_frame(const uint8_t *frame, size_t frame_bits) {
         // TODO: parse short frame fields more meaningfully based on DF.
         uint32_t payload = bits_get_u32(frame, 8, 24);
         uint32_t parity = bits_get_u32(frame, 32, 24);
-        printf("[adsb] parsed df=%u ca=%u payload=%06X parity=%06X\n",
-               df, ca, payload, parity);
+        //printf("[adsb] SHORT FRAME parsed df=%u ca=%u payload=%06X parity=%06X\n",
+        //       df, ca, payload, parity);
     }
 }
 
@@ -232,8 +232,8 @@ demod_output_t get_demod_output(adsb_ctx_t *ctx) {
 }
 
 void set_callbacks(adsb_ctx_t *ctx,
-                        adsb_on_bit_cb_t on_bit_cb, void *on_bit_user,
-                        adsb_on_frame_cb_t on_frame_cb, void *on_frame_user) {
+                   adsb_on_bit_cb_t on_bit_cb, void *on_bit_user,
+                   adsb_on_frame_cb_t on_frame_cb, void *on_frame_user) {
     if (!ctx) return;
     ctx->on_bit_cb = on_bit_cb;
     ctx->on_bit_user = on_bit_user;

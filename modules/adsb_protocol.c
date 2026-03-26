@@ -69,7 +69,7 @@ static void dispatch_tc_category(adsb_tc_category_t category,
                                       uint32_t pi,
                                       uint8_t tc);
 static char callsign_char(uint8_t code);
-static void get_callsign(uint64_t me, char *callsign, size_t callsign_len);
+static char* get_callsign(uint64_t me);
 
 
 static adsb_tc_category_t tc_category_from_value(uint8_t tc) {
@@ -134,12 +134,11 @@ static char callsign_char(uint8_t code) {
     return ' ';
 }
 
-static void get_callsign(uint64_t me, char *callsign, size_t callsign_len) {
+static char* get_callsign(uint64_t me) {
+    static char callsign[9];
     size_t n;
 
-    if (!callsign || callsign_len == 0u) return;
-
-    n = (callsign_len > 0u) ? (callsign_len - 1u) : 0u;
+    n = (sizeof(callsign) > 0u) ? (sizeof(callsign) - 1u) : 0u;
     if (n > 8u) n = 8u;
 
     for (size_t i = 0; i < n; i++) {
@@ -152,6 +151,7 @@ static void get_callsign(uint64_t me, char *callsign, size_t callsign_len) {
         callsign[n - 1u] = '\0';
         n--;
     }
+    return callsign;
 }
 
 void protocol_handle_message(uint8_t df, uint8_t ca, uint32_t icao, uint64_t me, uint32_t pi) {
@@ -161,12 +161,12 @@ void protocol_handle_message(uint8_t df, uint8_t ca, uint32_t icao, uint64_t me,
     tc = (uint8_t)bits_get_u32((const uint8_t *)&me, 0, 5);
 
     if (df != 17u && df != 18u) {
-        printf("[adsb][proto] df=%u ca=%u icao=%06X me=%014llX pi=%06X ignored: tc is meaningful here only for DF17/DF18\n",
-               df,
-               ca,
-               icao,
-               (unsigned long long)me,
-               pi);
+        // printf("[adsb][proto] df=%u ca=%u icao=%06X me=%014llX pi=%06X ignored: tc is meaningful here only for DF17/DF18\n",
+        //        df,
+        //        ca,
+        //        icao,
+        //        (unsigned long long)me,
+        //        pi);
         return;
     }
 
@@ -181,9 +181,8 @@ static const char *get_category(uint8_t tc, uint8_t ca) {
 
 static void handle_aircraft_identification(uint8_t df, uint8_t ca, uint32_t icao, uint64_t me, uint32_t pi, uint8_t tc) {
     const char *category = get_category(tc, ca);
-    char callsign[9];
 
-    get_callsign(me, callsign, sizeof(callsign));
+    char* callsign = get_callsign(me);
     printf("[adsb][ident] df=%u ca=%u icao=%06X category=%s callsign=%s pi=%06X\n",
            df,
            ca,

@@ -112,21 +112,21 @@ static void ais_run_test_module(void *ctx) {
 }
 
 static int adsb_init_module(void *ctx, const demod_config_t *cfg) {
-    adsb_init((adsb_ctx_t *)ctx, cfg ? cfg->output_fs : 0);
+    init((adsb_ctx_t *)ctx, cfg ? cfg->output_fs : 0);
     return 1;
 }
 
 static void adsb_fill_demod_config_module(void *ctx, demod_config_t *cfg) {
     (void)ctx;
-    adsb_get_demod_config(cfg);
+    get_demod_config(cfg);
 }
 
 static demod_output_t adsb_get_demod_output_module(void *ctx) {
-    return adsb_get_demod_output((adsb_ctx_t *)ctx);
+    return get_demod_output((adsb_ctx_t *)ctx);
 }
 
 static void adsb_flush_module(void *ctx) {
-    adsb_flush((adsb_ctx_t *)ctx);
+    flush((adsb_ctx_t *)ctx);
 }
 
 
