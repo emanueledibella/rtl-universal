@@ -1,9 +1,16 @@
+# Deps on mac
+```sh
+brew install librtlsdr liquid-dsp portaudio pkg-config
+export PKG_CONFIG_PATH="$(brew --prefix)/lib/pkgconfig:$(brew --prefix)/share/pkgconfig"
+```
+
 # To compile C
 ```sh
 make
 ```
 
 # Examples
+```sh
 ./wfm_live 145.500 --mode voice
 ./wfm_live 145.500 --mode voice --demod fm
 ./wfm_live 118.300 --mode voice --demod am
@@ -19,7 +26,5 @@ make
 ./wfm_live 162.025 --mode ais
 # Optional tuner bandwidth and ppm correction
 ./wfm_live 162.025 --mode ais --bw 25000 --ppm -20
+```
 
-
-brew install librtlsdr liquid-dsp portaudio pkg-config
-export PKG_CONFIG_PATH="$(brew --prefix)/lib/pkgconfig:$(brew --prefix)/share/pkgconfig"
