@@ -38,6 +38,21 @@ static const char *const k_aircraft_category[5][8] = {
     }
 };
 
+typedef struct {
+    uint8_t altitude;
+    uint8_t latitude;
+    uint8_t longitude;
+    uint8_t velocity;
+    char callsign[9];
+    const char* category;
+    uint16_t lat_cpr;
+    uint16_t lon_cpr;
+    uint32_t icao;
+} aircraft;
+
+aircraft aircrafts[2048];
+size_t num_aircrafts = 0;
+
 typedef enum {
     ADSB_TC_CATEGORY_UNKNOWN = 0,
     ADSB_TC_CATEGORY_AIRCRAFT_IDENTIFICATION,
@@ -70,7 +85,7 @@ static void dispatch_tc_category(adsb_tc_category_t category,
                                       uint8_t tc);
 static char callsign_char(uint8_t code);
 static char* get_callsign(uint64_t me);
-
+static size_t search_aircraft_by_icao(uint32_t icao);
 
 static adsb_tc_category_t tc_category_from_value(uint8_t tc) {
     if (tc >= 1u && tc <= 4u) return ADSB_TC_CATEGORY_AIRCRAFT_IDENTIFICATION;
@@ -83,6 +98,88 @@ static adsb_tc_category_t tc_category_from_value(uint8_t tc) {
     if (tc == 29u) return ADSB_TC_CATEGORY_TARGET_STATE_AND_STATUS;
     if (tc == 31u) return ADSB_TC_CATEGORY_AIRCRAFT_OPERATION_STATUS;
     return ADSB_TC_CATEGORY_UNKNOWN;
+}
+
+static size_t search_aircraft_by_icao(uint32_t icao) {
+    for (size_t i = 0; i < num_aircrafts; i++) {
+        if (aircrafts[i].icao == icao) {
+            return i;
+        }
+    }
+    return (size_t)-1;
+}
+
+static void update_aircraft(
+    aircraft *entry,
+    uint32_t icao,
+    uint8_t altitude,
+    uint8_t latitude,
+    uint8_t longitude,
+    uint8_t velocity,
+    const char *callsign,
+    const char *category,
+    uint16_t lat_cpr,
+    uint16_t lon_cpr
+    ) {
+    if (entry == NULL) return;
+
+    if (icao != 0u) entry->icao = icao;
+    if (altitude != 0u) entry->altitude = altitude;
+    if (latitude != 0u) entry->latitude = latitude;
+    if (longitude != 0u) entry->longitude = longitude;
+    if (velocity != 0u) entry->velocity = velocity;
+    if (lat_cpr != 0u) entry->lat_cpr = lat_cpr;
+    if (lon_cpr != 0u) entry->lon_cpr = lon_cpr;
+
+    if (callsign != NULL && callsign[0] != '\0') {
+        strncpy(entry->callsign, callsign, sizeof(entry->callsign) - 1u);
+        entry->callsign[sizeof(entry->callsign) - 1u] = '\0';
+    }
+
+    if (category != NULL) entry->category = category;
+}
+
+static size_t add_aircraft(
+    uint32_t icao,
+    uint8_t altitude,
+    uint8_t latitude,
+    uint8_t longitude,
+    uint8_t velocity,
+    const char *callsign,
+    const char *category,
+    uint16_t lat_cpr,
+    uint16_t lon_cpr
+    ) {
+    aircraft *entry;
+
+    if (num_aircrafts >= sizeof(aircrafts) / sizeof(aircrafts[0])) return (size_t)-1;
+    size_t index_current_aircraft = num_aircrafts;
+    entry = &aircrafts[num_aircrafts];
+    memset(entry, 0, sizeof(*entry));
+    update_aircraft(entry, icao, altitude, latitude, longitude, velocity, callsign, category, lat_cpr, lon_cpr);
+
+    num_aircrafts++;
+    return index_current_aircraft;
+}
+
+size_t add_or_update_aircraft(
+    uint32_t icao,
+    uint8_t altitude,
+    uint8_t latitude,
+    uint8_t longitude,
+    uint8_t velocity,
+    const char *callsign,
+    const char *category,
+    uint16_t lat_cpr,
+    uint16_t lon_cpr
+    ) {
+    size_t index = search_aircraft_by_icao(icao);
+    if (index != (size_t)-1) {
+        update_aircraft(&aircrafts[index], icao, altitude, latitude, longitude, velocity, callsign, category, lat_cpr, lon_cpr);
+        return index;
+    } else {
+        return add_aircraft(icao, altitude, latitude, longitude, velocity, callsign, category, lat_cpr, lon_cpr);
+    }
 }
 
 static void dispatch_tc_category(adsb_tc_category_t category,
@@ -183,6 +280,8 @@ static void handle_aircraft_identification(uint8_t df, uint8_t ca, uint32_t icao
     const char *category = get_category(tc, ca);
 
     char* callsign = get_callsign(me);
+    add_or_update_aircraft(icao, 0u, 0u, 0u, 0u, callsign, category, 0u, 0u);
+
     printf("[adsb][ident] df=%u ca=%u icao=%06X category=%s callsign=%s pi=%06X\n",
            df,
            ca,
@@ -193,12 +292,18 @@ static void handle_aircraft_identification(uint8_t df, uint8_t ca, uint32_t icao
 }
 
 static void handle_surface_position(uint8_t df, uint8_t ca, uint32_t icao, uint64_t me, uint32_t pi, uint8_t tc) {
-    (void)df;
-    (void)ca;
-    (void)icao;
-    (void)me;
-    (void)pi;
-    (void)tc;
+    uint8_t ss = (uint8_t)bits_get_u32((const uint8_t *)&me, 5, 2);
+    uint8_t saf = (uint8_t)bits_get_u32((const uint8_t *)&me, 7, 1);
+    uint8_t alt = (uint8_t)bits_get_u32((const uint8_t *)&me, 8, 12);
+    uint8_t t = (uint8_t)bits_get_u32((const uint8_t *)&me, 20, 1);
+    uint8_t f = (uint8_t)bits_get_u32((const uint8_t *)&me, 21, 1);
+    uint8_t lat_cpr = (uint8_t)bits_get_u32((const uint8_t *)&me, 22, 17);
+    uint8_t lon_cpr = (uint8_t)bits_get_u32((const uint8_t *)&me, 39, 17);
+    // N_z represents the number of latitude zones between the equator and a pole. 
+    // In Mode S, it is fixed to 15, but in ADS-B it can be 15 or 16 depending on the type of message. For surface position messages, N_z is 15.
+    uint8_t n_z = 15;
+
+
 }
 
 static void handle_airborne_position_baro(uint8_t df, uint8_t ca, uint32_t icao, uint64_t me, uint32_t pi, uint8_t tc) {
