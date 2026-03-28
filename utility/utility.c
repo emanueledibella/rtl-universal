@@ -1,4 +1,5 @@
 #include "utility.h"
+#include <math.h>
 
 uint32_t bits_get_u32(const uint8_t *bytes, int start_bit, int bit_len) {
     uint32_t v = 0;
@@ -22,4 +23,12 @@ uint64_t bits_get_u64(const uint8_t *bytes, int start_bit, int bit_len) {
         v = (v << 1) | (uint64_t)bit;
     }
     return v;
+}
+
+float mod(float a, float b) {
+    return a - b * floor(a / b);
+}
+
+uint32_t max(uint32_t a, uint32_t b) {
+    return (a > b) ? a : b;
 }
