@@ -5,6 +5,10 @@
 #include <string.h>
 #include <stdbool.h>
 #include <math.h>
+#include <time.h>
+
+#define ADSB_ME_BITS 56u
+#define CPR_AIRBORNE_PAIR_MAX_DT 10u
 
 static const char *const k_aircraft_category[5][8] = {
     [1] = {
@@ -52,8 +56,8 @@ typedef struct {
     double lon_cpr_odd;
     double lon_cpr_even;
     uint32_t icao;
-    uint8_t time_even;
-    uint8_t time_odd;
+    uint32_t time_even;
+    uint32_t time_odd;
 } aircraft;
 
 aircraft aircrafts[2048];
@@ -92,12 +96,16 @@ static void dispatch_tc_category(adsb_tc_category_t category,
 static char callsign_char(uint8_t code);
 static char* get_callsign(uint64_t me);
 static size_t search_aircraft_by_icao(uint32_t icao);
+static uint32_t me_get_u32(uint64_t me, unsigned int start_bit, unsigned int bit_len);
+static double positive_mod(double value, double modulus);
+static int cpr_nl(double lat, uint16_t n_z);
 
 static void print_aircraft_info(size_t index) {
     if (index == (size_t)-1) return;
     aircraft *entry = &aircrafts[index];
-    printf("[adsb] icao=%06X alt=%u lat=%.6f lon=%.6f vel=%u callsign=%s category=%s\n",
-           entry->icao, entry->altitude, entry->latitude, entry->longitude, entry->velocity, entry->callsign, entry->category);
+    uint32_t timestamp = (uint32_t)time(NULL);
+    printf("[adsb] [timestamp=%u] - icao=%06X alt=%u lat=%.6f lon=%.6f vel=%u callsign=%s category=%s\n",
+           timestamp, entry->icao, entry->altitude, entry->latitude, entry->longitude, entry->velocity, entry->callsign, entry->category);
 }
 
 static adsb_tc_category_t tc_category_from_value(uint8_t tc) {
@@ -122,6 +130,47 @@ static size_t search_aircraft_by_icao(uint32_t icao) {
     return (size_t)-1;
 }
 
+static uint32_t me_get_u32(uint64_t me, unsigned int start_bit, unsigned int bit_len) {
+    uint64_t mask;
+    unsigned int shift;
+
+    if (bit_len == 0u || bit_len > 32u) return 0u;
+    if (start_bit + bit_len > ADSB_ME_BITS) return 0u;
+
+    shift = ADSB_ME_BITS - start_bit - bit_len;
+    mask = ((uint64_t)1u << bit_len) - 1u;
+    return (uint32_t)((me >> shift) & mask);
+}
+
+static double positive_mod(double value, double modulus) {
+    return value - modulus * floor(value / modulus);
+}
+
+static int cpr_nl(double lat, uint16_t n_z) {
+    double abs_lat = fabs(lat);
+    double denom;
+    double a;
+    double b;
+    double arg;
+    int nl;
+
+    if (abs_lat >= 87.0) return 1;
+
+    a = 1.0 - cos(M_PI / (2.0 * (double)n_z));
+    b = cos(M_PI / 180.0 * abs_lat);
+    if (b == 0.0) return 1;
+
+    arg = 1.0 - (a / (b * b));
+    if (arg < -1.0) arg = -1.0;
+    if (arg > 1.0) arg = 1.0;
+
+    denom = acos(arg);
+    if (denom <= 0.0) return 1;
+
+    nl = (int)floor((2.0 * M_PI) / denom);
+    return (nl < 1) ? 1 : nl;
+}
+
 static void update_aircraft(
     aircraft *entry,
     uint32_t icao,
@@ -135,8 +184,8 @@ static void update_aircraft(
     double lat_cpr_even,
     double lon_cpr_odd,
     double lon_cpr_even,
-    uint8_t time_even,
-    uint8_t time_odd
+    uint32_t time_even,
+    uint32_t time_odd
     ) {
     if (entry == NULL) return;
 
@@ -172,8 +221,8 @@ static size_t add_aircraft(
     double lat_cpr_even,
     double lon_cpr_odd,
     double lon_cpr_even,
-    uint8_t time_even,
-    uint8_t time_odd
+    uint32_t time_even,
+    uint32_t time_odd
     ) {
     aircraft *entry;
 
@@ -199,8 +248,8 @@ size_t add_or_update_aircraft(
     double lat_cpr_even,
     double lon_cpr_odd,
     double lon_cpr_even,
-    uint8_t time_even,
-    uint8_t time_odd
+    uint32_t time_even,
+    uint32_t time_odd
     ) {
     size_t index = search_aircraft_by_icao(icao);
     if (index != (size_t)-1) {
@@ -268,7 +317,7 @@ static char* get_callsign(uint64_t me) {
     if (n > 8u) n = 8u;
 
     for (size_t i = 0; i < n; i++) {
-        uint8_t code = (uint8_t)bits_get_u32((const uint8_t *)&me, 8 + (int)(i * 6u), 6);
+        uint8_t code = (uint8_t)me_get_u32(me, 8u + (unsigned int)(i * 6u), 6u);
         callsign[i] = callsign_char(code);
     }
     callsign[n] = '\0';
@@ -284,7 +333,7 @@ void protocol_handle_message(uint8_t df, uint8_t ca, uint32_t icao, uint64_t me,
     uint8_t tc;
     adsb_tc_category_t category;
 
-    tc = (uint8_t)bits_get_u32((const uint8_t *)&me, 0, 5);
+    tc = (uint8_t)me_get_u32(me, 0u, 5u);
 
     if (df != 17u && df != 18u) {
         // printf("[adsb][proto] df=%u ca=%u icao=%06X me=%014llX pi=%06X ignored: tc is meaningful here only for DF17/DF18\n",
@@ -299,20 +348,8 @@ void protocol_handle_message(uint8_t df, uint8_t ca, uint32_t icao, uint64_t me,
     category = tc_category_from_value(tc);
     dispatch_tc_category(category, df, ca, icao, me, pi, tc);
     size_t index = search_aircraft_by_icao(icao);
-    if (index == (size_t)-1) {
-        printf(
-            "[adsb][proto] df=%u ca=%u icao=%06X me=%014llX pi=%06X tc=%u category=%d\n",
-            df,
-            ca,
-            icao,
-            (unsigned long long)me,
-            pi,
-            tc,
-            category
-        );
-    } else {
-        print_aircraft_info(index);
-    }
+    
+    print_aircraft_info(index);
 
 }
 
@@ -340,17 +377,19 @@ double calc_latitude(uint16_t n_z, double lat_cpr_even, double lat_cpr_odd, uint
     double lat = 0;
     double dlat_even = 360.0 / (4 * n_z);
     double dlat_odd = 360.0 / (4 * n_z - 1);
+    int nl_lat_even;
+    int nl_lat_odd;
     // latitude zone index
     double j = floor(59 * lat_cpr_even - 60 * lat_cpr_odd + 0.5);
 
-    double lat_even = dlat_even * (mod(j, 60) + lat_cpr_even);
-    double lat_odd = dlat_odd * (mod(j, 59) + lat_cpr_odd);
+    double lat_even = dlat_even * (positive_mod(j, 60.0) + lat_cpr_even);
+    double lat_odd = dlat_odd * (positive_mod(j, 59.0) + lat_cpr_odd);
 
     if (lat_even >= 270) lat_even -= 360;
     if (lat_odd >= 270) lat_odd -= 360;
 
-    double nl_lat_even = floor(2 * M_PI / (acos(1 - (1 - cos(M_PI / 2 * n_z)) / pow(cos(M_PI / 180.0 * lat_even), 2))));
-    double nl_lat_odd = floor(2 * M_PI / (acos(1 - (1 - cos(M_PI / 2 * n_z)) / pow(cos(M_PI / 180.0 * lat_odd), 2))));
+    nl_lat_even = cpr_nl(lat_even, n_z);
+    nl_lat_odd = cpr_nl(lat_odd, n_z);
     if (nl_lat_even != nl_lat_odd) {
         return 0;
     }
@@ -364,18 +403,18 @@ double calc_latitude(uint16_t n_z, double lat_cpr_even, double lat_cpr_odd, uint
 
 double calc_longitude(uint16_t n_z, double lat, double lon_cpr_even, double lon_cpr_odd, uint32_t time_even, uint32_t time_odd) {
     double lon = 0;
-    double nl_lat = floor(2 * M_PI / (acos(1 - (1 - cos(M_PI / 2 * n_z)) / pow(cos(M_PI / 180.0 * lat), 2))));
+    int nl_lat = cpr_nl(lat, n_z);
     // longitude zone index
     double m = floor(lon_cpr_even * (nl_lat - 1) - lon_cpr_odd * nl_lat + 0.5);
     // numbers of longitude zones
-    double n_even = max(1, nl_lat);
-    double n_odd = max(1, nl_lat - 1);
+    double n_even = (nl_lat < 1) ? 1.0 : (double)nl_lat;
+    double n_odd = (nl_lat - 1 < 1) ? 1.0 : (double)(nl_lat - 1);
     // longitude zone size
     double dlon_even = 360.0 / n_even;
     double dlon_odd = 360.0 / n_odd;
     // longitude
-    double lon_even = dlon_even * (mod(m, n_even) + lon_cpr_even);
-    double lon_odd = dlon_odd * (mod(m, n_odd) + lon_cpr_odd);
+    double lon_even = dlon_even * (positive_mod(m, n_even) + lon_cpr_even);
+    double lon_odd = dlon_odd * (positive_mod(m, n_odd) + lon_cpr_odd);
     if (time_even >= time_odd) {
         lon = lon_even;
     } else {
@@ -388,29 +427,35 @@ double calc_longitude(uint16_t n_z, double lat, double lon_cpr_even, double lon_
 void global_position_decoding(size_t index, uint16_t n_z, uint32_t icao) {
     double lat = 0;
     double lon = 0;
-    bool has_lat = false;
-    bool has_lon = false;
     //if I have lat I use Locally unambiguous position decoding
     if (index != (size_t)-1) {
         aircraft *entry = &aircrafts[index];
+        uint32_t dt;
 
-        has_lat = entry->lat_cpr_even != 0u && entry->lat_cpr_odd != 0u && entry->latitude == 0u; 
-        has_lon = entry->lon_cpr_even != 0u && entry->lon_cpr_odd != 0u && entry->longitude == 0u;
+        if (entry->lat_cpr_even == 0.0 || entry->lat_cpr_odd == 0.0) return;
+        if (entry->lon_cpr_even == 0.0 || entry->lon_cpr_odd == 0.0) return;
+        if (entry->time_even == 0u || entry->time_odd == 0u) return;
 
-        if (has_lat) {
-            //calc lat
-            lat = calc_latitude(n_z, entry->lat_cpr_even, entry->lat_cpr_odd, entry->time_even, entry->time_odd);
-            if (lat == 0) {
-                printf("[adsb][surface] Invalid latitude calculation for icao=%06X\n", icao);
-                return;
-            }
-            add_or_update_aircraft(icao, 0u, lat, 0u, 0u, NULL, NULL, 0u, 0u, 0u, 0u, 0u, 0u);
+        dt = (entry->time_even >= entry->time_odd)
+            ? (entry->time_even - entry->time_odd)
+            : (entry->time_odd - entry->time_even);
+        if (dt > CPR_AIRBORNE_PAIR_MAX_DT) {
+            return;
         }
-        if (has_lon && entry->latitude != 0u) {
-            //calc lon
-            lon = calc_longitude(n_z, entry->latitude, entry->lon_cpr_even, entry->lon_cpr_odd, entry->time_even, entry->time_odd);
-            add_or_update_aircraft(icao, 0u, 0u, lon, 0u, NULL, NULL, 0u, 0u, 0u, 0u, 0u, 0u);
+
+        lat = calc_latitude(n_z, entry->lat_cpr_even, entry->lat_cpr_odd, entry->time_even, entry->time_odd);
+        if (!isfinite(lat) || lat < -90.0 || lat > 90.0) {
+            printf("[adsb][surface] Invalid latitude calculation for icao=%06X\n", icao);
+            return;
         }
+
+        lon = calc_longitude(n_z, lat, entry->lon_cpr_even, entry->lon_cpr_odd, entry->time_even, entry->time_odd);
+        if (!isfinite(lon) || lon < -180.0 || lon > 180.0) {
+            printf("[adsb][surface] Invalid longitude calculation for icao=%06X\n", icao);
+            return;
+        }
+
+        add_or_update_aircraft(icao, 0u, lat, lon, 0u, NULL, NULL, 0u, 0u, 0u, 0u, 0u, 0u);
     }
 }
 
@@ -418,21 +463,20 @@ void locally_unambiguous_position_decoding(aircraft *entry) {
 
 }
 
-static void handle_surface_position(uint8_t df, uint8_t ca, uint32_t icao, uint64_t me, uint32_t pi, uint8_t tc) {
-    uint8_t ss = (uint8_t)bits_get_u32((const uint8_t *)&me, 5, 2);
-    uint8_t saf = (uint8_t)bits_get_u32((const uint8_t *)&me, 7, 1);
-    uint16_t alt = (uint16_t)bits_get_u32((const uint8_t *)&me, 8, 12);
-    uint8_t t = (uint8_t)bits_get_u32((const uint8_t *)&me, 20, 1);
-    uint8_t f = (uint8_t)bits_get_u32((const uint8_t *)&me, 21, 1);
-    double lat_cpr = (double)bits_get_u32((const uint8_t *)&me, 22, 17);
-    double lon_cpr = (double)bits_get_u32((const uint8_t *)&me, 39, 17);
+static void handle_airborne_position_baro(uint8_t df, uint8_t ca, uint32_t icao, uint64_t me, uint32_t pi, uint8_t tc) {
+    uint8_t ss = (uint8_t)me_get_u32(me, 5u, 2u);
+    uint8_t saf = (uint8_t)me_get_u32(me, 7u, 1u);
+    uint16_t alt = (uint16_t)me_get_u32(me, 8u, 12u);
+    uint8_t t = (uint8_t)me_get_u32(me, 20u, 1u);
+    uint8_t f = (uint8_t)me_get_u32(me, 21u, 1u);
+    double lat_cpr = (double)me_get_u32(me, 22u, 17u);
+    double lon_cpr = (double)me_get_u32(me, 39u, 17u);
     // N_z represents the number of latitude zones between the equator and a pole. 
     // In Mode S, for surface position messages, N_z is 15.
     uint16_t n_z = 15;
-    uint8_t old_time_even = 0;
-    uint8_t old_time_odd = 0;
-
     size_t index = search_aircraft_by_icao(icao);
+
+    uint32_t timestamp = (uint32_t)time(NULL);
 
     printf(
         "[adsb][surface] df=%u ca=%u icao=%06X me=%014llX pi=%06X tc=%u ss=%u saf=%u alt=%u t=%u f=%u lat_cpr=%.5f lon_cpr=%.5f\n",
@@ -450,6 +494,7 @@ static void handle_surface_position(uint8_t df, uint8_t ca, uint32_t icao, uint6
         lat_cpr,
         lon_cpr
     );
+
     if (index != (size_t)-1) {
         // existing aircraft, check if we have a more recent position message
         aircraft *entry = &aircrafts[index];
@@ -458,32 +503,36 @@ static void handle_surface_position(uint8_t df, uint8_t ca, uint32_t icao, uint6
             //locally_unambiguous_position_decoding(entry);
         }
 
-        if (t == 0 && entry->time_even >= t) {
+        if (f == 0 && entry->time_even >= timestamp) {
             // existing even message is more recent or same age, ignore this one
             return;
         }
-        if (t == 1 && entry->time_odd >= t) {
+        if (f == 1 && entry->time_odd >= timestamp) {
             // existing odd message is more recent or same age, ignore this one
             return;
         }
     }
 
+    lat_cpr /= 131072.0;
+    lon_cpr /= 131072.0;
+
     if (f == 0) {
         // even
-        add_or_update_aircraft(icao, alt, 0u, 0u, 0u, NULL, NULL, lat_cpr, 0u, lon_cpr, 0u, t, 0u);
+        add_or_update_aircraft(icao, alt, 0u, 0u, 0u, NULL, NULL, lat_cpr, 0u, lon_cpr, 0u, timestamp, 0u);
     } else if (f == 1) {
         // odd
-        add_or_update_aircraft(icao, alt, 0u, 0u, 0u, NULL, NULL, 0u, lat_cpr, 0u, lon_cpr, 0u, t);
+        add_or_update_aircraft(icao, alt, 0u, 0u, 0u, NULL, NULL, 0u, lat_cpr, 0u, lon_cpr, 0u, timestamp);
     } else {
         printf("[adsb][surface] Invalid format bit f=%u\n", f);
         return;
     }
 
+    index = search_aircraft_by_icao(icao);
     global_position_decoding(index, n_z, icao);
 
 }
 
-static void handle_airborne_position_baro(uint8_t df, uint8_t ca, uint32_t icao, uint64_t me, uint32_t pi, uint8_t tc) {
+static void handle_surface_position(uint8_t df, uint8_t ca, uint32_t icao, uint64_t me, uint32_t pi, uint8_t tc) {
     (void)df;
     (void)ca;
     (void)icao;
