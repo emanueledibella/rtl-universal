@@ -103,8 +103,14 @@ static void print_aircraft_info(size_t index) {
     if (index == (size_t)-1) return;
     aircraft *entry = &aircrafts[index];
     uint32_t timestamp = (uint32_t)time(NULL);
-    printf("[adsb] [timestamp=%u] - icao=%06X alt=%u lat=%.6f lon=%.6f vel=%u callsign=%s category=%s\n",
-           timestamp, entry->icao, entry->altitude, entry->latitude, entry->longitude, entry->velocity, entry->callsign, entry->category);
+    int dayOfMonth = (timestamp / 86400) % 30 + 1;
+    int month = ((timestamp / 2592000) % 12) + 1;
+    int year = (timestamp / 31536000) + 1970;
+    int hour = (timestamp % 86400) / 3600;
+    int minute = (timestamp % 3600) / 60;
+    int second = timestamp % 60;
+    printf("[adsb] [%04d-%02d-%02d %02d:%02d:%02d] - icao=%06X alt=%u coordinates=%.6f,%.6f vel=%u callsign=%s category=%s\n",
+           year, month, dayOfMonth, hour, minute, second, entry->icao, entry->altitude, entry->latitude, entry->longitude, entry->velocity, entry->callsign, entry->category);
 }
 
 static adsb_tc_category_t tc_category_from_value(uint8_t tc) {
@@ -474,22 +480,22 @@ static void handle_airborne_position_baro(uint8_t df, uint8_t ca, uint32_t icao,
 
     uint32_t timestamp = (uint32_t)time(NULL);
 
-    printf(
-        "[adsb][airborne position] df=%u ca=%u icao=%06X me=%014llX pi=%06X tc=%u ss=%u saf=%u alt=%u t=%u f=%u lat_cpr=%.5f lon_cpr=%.5f\n",
-        df,
-        ca,
-        icao,
-        (unsigned long long)me,
-        pi,
-        tc,
-        ss,
-        saf,
-        alt,
-        t,
-        f,
-        lat_cpr,
-        lon_cpr
-    );
+    // printf(
+    //     "[adsb][airborne position] df=%u ca=%u icao=%06X me=%014llX pi=%06X tc=%u ss=%u saf=%u alt=%u t=%u f=%u lat_cpr=%.5f lon_cpr=%.5f\n",
+    //     df,
+    //     ca,
+    //     icao,
+    //     (unsigned long long)me,
+    //     pi,
+    //     tc,
+    //     ss,
+    //     saf,
+    //     alt,
+    //     t,
+    //     f,
+    //     lat_cpr,
+    //     lon_cpr
+    // );
 
     if (index != (size_t)-1) {
         // existing aircraft, check if we have a more recent position message
