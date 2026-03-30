@@ -97,7 +97,6 @@ static char callsign_char(uint8_t code);
 static char* get_callsign(uint64_t me);
 static size_t search_aircraft_by_icao(uint32_t icao);
 static uint32_t me_get_u32(uint64_t me, unsigned int start_bit, unsigned int bit_len);
-static double positive_mod(double value, double modulus);
 static int cpr_nl(double lat, uint16_t n_z);
 
 static void print_aircraft_info(size_t index) {
@@ -329,7 +328,7 @@ void protocol_handle_message(uint8_t df, uint8_t ca, uint32_t icao, uint64_t me,
     uint8_t tc;
     adsb_tc_category_t category;
 
-    tc = (uint8_t)me_get_u32(me, 0u, 5u);
+    tc = (me >> 51) & 0x1F;     // 5 bit
 
     if (df != 17u && df != 18u) {
         // printf("[adsb][proto] df=%u ca=%u icao=%06X me=%014llX pi=%06X ignored: tc is meaningful here only for DF17/DF18\n",
@@ -460,13 +459,14 @@ void locally_unambiguous_position_decoding(aircraft *entry) {
 }
 
 static void handle_airborne_position_baro(uint8_t df, uint8_t ca, uint32_t icao, uint64_t me, uint32_t pi, uint8_t tc) {
-    uint8_t ss = (uint8_t)me_get_u32(me, 5u, 2u);
-    uint8_t saf = (uint8_t)me_get_u32(me, 7u, 1u);
-    uint16_t alt = (uint16_t)me_get_u32(me, 8u, 12u);
-    uint8_t t = (uint8_t)me_get_u32(me, 20u, 1u);
-    uint8_t f = (uint8_t)me_get_u32(me, 21u, 1u);
-    double lat_cpr = (double)me_get_u32(me, 22u, 17u);
-    double lon_cpr = (double)me_get_u32(me, 39u, 17u);
+    uint8_t  ss      = (me >> 49) & 0x03;     // 2 bit
+    uint8_t  saf     = (me >> 48) & 0x01;     // 1 bit
+    uint16_t alt     = (me >> 36) & 0x0FFF;   // 12 bit
+    uint8_t  t       = (me >> 35) & 0x01;     // 1 bit
+    uint8_t  f       = (me >> 34) & 0x01;     // 1 bit
+    double lat_cpr = (me >> 17) & 0x1FFFF;  // 17 bit
+    double lon_cpr =  me        & 0x1FFFF;  // 17 bit
+
     // N_z represents the number of latitude zones between the equator and a pole. 
     // In Mode S, for surface position messages, N_z is 15.
     uint16_t n_z = 15;
@@ -475,7 +475,7 @@ static void handle_airborne_position_baro(uint8_t df, uint8_t ca, uint32_t icao,
     uint32_t timestamp = (uint32_t)time(NULL);
 
     printf(
-        "[adsb][surface] df=%u ca=%u icao=%06X me=%014llX pi=%06X tc=%u ss=%u saf=%u alt=%u t=%u f=%u lat_cpr=%.5f lon_cpr=%.5f\n",
+        "[adsb][airborne position] df=%u ca=%u icao=%06X me=%014llX pi=%06X tc=%u ss=%u saf=%u alt=%u t=%u f=%u lat_cpr=%.5f lon_cpr=%.5f\n",
         df,
         ca,
         icao,
@@ -514,13 +514,14 @@ static void handle_airborne_position_baro(uint8_t df, uint8_t ca, uint32_t icao,
 
     if (f == 0) {
         // even
-        add_or_update_aircraft(icao, alt, 0u, 0u, 0u, NULL, NULL, lat_cpr, 0u, lon_cpr, 0u, timestamp, 0u);
+        add_or_update_aircraft(icao, 0u, 0u, 0u, 0u, NULL, NULL,
+                            0u, lat_cpr, 0u, lon_cpr,
+                            timestamp, 0u);
     } else if (f == 1) {
         // odd
-        add_or_update_aircraft(icao, alt, 0u, 0u, 0u, NULL, NULL, 0u, lat_cpr, 0u, lon_cpr, 0u, timestamp);
-    } else {
-        printf("[adsb][surface] Invalid format bit f=%u\n", f);
-        return;
+        add_or_update_aircraft(icao, 0u, 0u, 0u, 0u, NULL, NULL,
+                            lat_cpr, 0u, lon_cpr, 0u,
+                            0u, timestamp);
     }
 
     index = search_aircraft_by_icao(icao);

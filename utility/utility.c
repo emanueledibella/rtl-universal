@@ -29,7 +29,7 @@ float mod(float a, float b) {
     return a - b * floor(a / b);
 }
 
-static double positive_mod(double value, double modulus) {
+double positive_mod(double value, double modulus) {
     return value - modulus * floor(value / modulus);
 }
 
