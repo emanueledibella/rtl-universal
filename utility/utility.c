@@ -29,6 +29,10 @@ float mod(float a, float b) {
     return a - b * floor(a / b);
 }
 
+static double positive_mod(double value, double modulus) {
+    return value - modulus * floor(value / modulus);
+}
+
 uint32_t max(uint32_t a, uint32_t b) {
     return (a > b) ? a : b;
 }

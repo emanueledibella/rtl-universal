@@ -142,10 +142,6 @@ static uint32_t me_get_u32(uint64_t me, unsigned int start_bit, unsigned int bit
     return (uint32_t)((me >> shift) & mask);
 }
 
-static double positive_mod(double value, double modulus) {
-    return value - modulus * floor(value / modulus);
-}
-
 static int cpr_nl(double lat, uint16_t n_z) {
     double abs_lat = fabs(lat);
     double denom;
