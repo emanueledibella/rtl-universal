@@ -5,7 +5,10 @@
 #include <string.h>
 #include <stdbool.h>
 #include <math.h>
+#include <stdlib.h>
 #include <time.h>
+
+static const char *const k_adsb_timezone = "Europe/Rome";
 
 #define ADSB_ME_BITS 56u
 #define CPR_AIRBORNE_PAIR_MAX_DT 10u
@@ -98,19 +101,50 @@ static char* get_callsign(uint64_t me);
 static size_t search_aircraft_by_icao(uint32_t icao);
 static uint32_t me_get_u32(uint64_t me, unsigned int start_bit, unsigned int bit_len);
 static int cpr_nl(double lat, uint16_t n_z);
+static void ensure_local_timezone(void);
+
+static void ensure_local_timezone(void) {
+    static int timezone_initialized = 0;
+
+    if (timezone_initialized) return;
+
+    if (k_adsb_timezone[0] != '\0') {
+        setenv("TZ", k_adsb_timezone, 1);
+        tzset();
+    }
+
+    timezone_initialized = 1;
+}
 
 static void print_aircraft_info(size_t index) {
     if (index == (size_t)-1) return;
+
     aircraft *entry = &aircrafts[index];
-    uint32_t timestamp = (uint32_t)time(NULL);
-    int dayOfMonth = (timestamp / 86400) % 30 + 1;
-    int month = ((timestamp / 2592000) % 12) + 1;
-    int year = (timestamp / 31536000) + 1970;
-    int hour = (timestamp % 86400) / 3600;
-    int minute = (timestamp % 3600) / 60;
-    int second = timestamp % 60;
+    time_t now = time(NULL);
+    struct tm local_tm;
+
+    ensure_local_timezone();
+
+    if (localtime_r(&now, &local_tm) == NULL) {
+        printf("[adsb] [time-unavailable] - icao=%06X alt=%u coordinates=%.6f,%.6f vel=%u callsign=%s category=%s\n",
+               entry->icao, entry->altitude, entry->latitude, entry->longitude, entry->velocity, entry->callsign, entry->category);
+        return;
+    }
+
     printf("[adsb] [%04d-%02d-%02d %02d:%02d:%02d] - icao=%06X alt=%u coordinates=%.6f,%.6f vel=%u callsign=%s category=%s\n",
-           year, month, dayOfMonth, hour, minute, second, entry->icao, entry->altitude, entry->latitude, entry->longitude, entry->velocity, entry->callsign, entry->category);
+           local_tm.tm_year + 1900,
+           local_tm.tm_mon + 1,
+           local_tm.tm_mday,
+           local_tm.tm_hour,
+           local_tm.tm_min,
+           local_tm.tm_sec,
+           entry->icao,
+           entry->altitude,
+           entry->latitude,
+           entry->longitude,
+           entry->velocity,
+           entry->callsign,
+           entry->category);
 }
 
 static adsb_tc_category_t tc_category_from_value(uint8_t tc) {
