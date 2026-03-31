@@ -12,6 +12,9 @@ static const char *const k_adsb_timezone = "Europe/Rome";
 
 #define ADSB_ME_BITS 56u
 #define CPR_AIRBORNE_PAIR_MAX_DT 10u
+// N_z represents the number of latitude zones between the equator and a pole. 
+// In Mode S, for surface position messages, N_z is 15.
+#define N_Z 15
 
 static const char *const k_aircraft_category[5][8] = {
     [1] = {
@@ -100,7 +103,7 @@ static char callsign_char(uint8_t code);
 static char* get_callsign(uint64_t me);
 static size_t search_aircraft_by_icao(uint32_t icao);
 static uint32_t me_get_u32(uint64_t me, unsigned int start_bit, unsigned int bit_len);
-static int cpr_nl(double lat, uint16_t n_z);
+static int cpr_nl(double lat);
 static void ensure_local_timezone(void);
 
 static void ensure_local_timezone(void) {
@@ -181,7 +184,7 @@ static uint32_t me_get_u32(uint64_t me, unsigned int start_bit, unsigned int bit
     return (uint32_t)((me >> shift) & mask);
 }
 
-static int cpr_nl(double lat, uint16_t n_z) {
+static int cpr_nl(double lat) {
     double abs_lat = fabs(lat);
     double denom;
     double a;
@@ -191,7 +194,7 @@ static int cpr_nl(double lat, uint16_t n_z) {
 
     if (abs_lat >= 87.0) return 1;
 
-    a = 1.0 - cos(M_PI / (2.0 * (double)n_z));
+    a = 1.0 - cos(M_PI / (2.0 * (double)N_Z));
     b = cos(M_PI / 180.0 * abs_lat);
     if (b == 0.0) return 1;
 
@@ -408,10 +411,10 @@ static void handle_aircraft_identification(uint8_t df, uint8_t ca, uint32_t icao
     //        pi);
 }
 
-double calc_latitude(uint16_t n_z, double lat_cpr_even, double lat_cpr_odd, uint32_t time_even, uint32_t time_odd) {
+double calc_latitude(double lat_cpr_even, double lat_cpr_odd, uint32_t time_even, uint32_t time_odd) {
     double lat = 0;
-    double dlat_even = 360.0 / (4 * n_z);
-    double dlat_odd = 360.0 / (4 * n_z - 1);
+    double dlat_even = 360.0 / (4 * N_Z);
+    double dlat_odd = 360.0 / (4 * N_Z - 1);
     int nl_lat_even;
     int nl_lat_odd;
     // latitude zone index
@@ -423,8 +426,8 @@ double calc_latitude(uint16_t n_z, double lat_cpr_even, double lat_cpr_odd, uint
     if (lat_even >= 270) lat_even -= 360;
     if (lat_odd >= 270) lat_odd -= 360;
 
-    nl_lat_even = cpr_nl(lat_even, n_z);
-    nl_lat_odd = cpr_nl(lat_odd, n_z);
+    nl_lat_even = cpr_nl(lat_even);
+    nl_lat_odd = cpr_nl(lat_odd);
     if (nl_lat_even != nl_lat_odd) {
         return 0;
     }
@@ -436,9 +439,9 @@ double calc_latitude(uint16_t n_z, double lat_cpr_even, double lat_cpr_odd, uint
     return lat;
 }
 
-double calc_longitude(uint16_t n_z, double lat, double lon_cpr_even, double lon_cpr_odd, uint32_t time_even, uint32_t time_odd) {
+double calc_longitude(double lat, double lon_cpr_even, double lon_cpr_odd, uint32_t time_even, uint32_t time_odd) {
     double lon = 0;
-    int nl_lat = cpr_nl(lat, n_z);
+    int nl_lat = cpr_nl(lat);
     // longitude zone index
     double m = floor(lon_cpr_even * (nl_lat - 1) - lon_cpr_odd * nl_lat + 0.5);
     // numbers of longitude zones
@@ -459,10 +462,9 @@ double calc_longitude(uint16_t n_z, double lat, double lon_cpr_even, double lon_
     return lon;
 }
 
-void global_position_decoding(size_t index, uint16_t n_z, uint32_t icao) {
+void global_position_decoding(size_t index, uint32_t icao) {
     double lat = 0;
     double lon = 0;
-    //if I have lat I use Locally unambiguous position decoding
     if (index != (size_t)-1) {
         aircraft *entry = &aircrafts[index];
         uint32_t dt;
@@ -478,13 +480,13 @@ void global_position_decoding(size_t index, uint16_t n_z, uint32_t icao) {
             return;
         }
 
-        lat = calc_latitude(n_z, entry->lat_cpr_even, entry->lat_cpr_odd, entry->time_even, entry->time_odd);
+        lat = calc_latitude(entry->lat_cpr_even, entry->lat_cpr_odd, entry->time_even, entry->time_odd);
         if (!isfinite(lat) || lat < -90.0 || lat > 90.0) {
             printf("[adsb][surface] Invalid latitude calculation for icao=%06X\n", icao);
             return;
         }
 
-        lon = calc_longitude(n_z, lat, entry->lon_cpr_even, entry->lon_cpr_odd, entry->time_even, entry->time_odd);
+        lon = calc_longitude(lat, entry->lon_cpr_even, entry->lon_cpr_odd, entry->time_even, entry->time_odd);
         if (!isfinite(lon) || lon < -180.0 || lon > 180.0) {
             printf("[adsb][surface] Invalid longitude calculation for icao=%06X\n", icao);
             return;
@@ -494,7 +496,7 @@ void global_position_decoding(size_t index, uint16_t n_z, uint32_t icao) {
     }
 }
 
-void locally_unambiguous_position_decoding(aircraft *entry) {
+void locally_unambiguous_position_decoding(size_t index, uint32_t icao) {
 
 }
 
@@ -507,9 +509,6 @@ static void handle_airborne_position_baro(uint8_t df, uint8_t ca, uint32_t icao,
     double lat_cpr = (me >> 17) & 0x1FFFF;  // 17 bit
     double lon_cpr =  me        & 0x1FFFF;  // 17 bit
 
-    // N_z represents the number of latitude zones between the equator and a pole. 
-    // In Mode S, for surface position messages, N_z is 15.
-    uint16_t n_z = 15;
     size_t index = search_aircraft_by_icao(icao);
 
     uint32_t timestamp = (uint32_t)time(NULL);
@@ -531,24 +530,6 @@ static void handle_airborne_position_baro(uint8_t df, uint8_t ca, uint32_t icao,
     //     lon_cpr
     // );
 
-    if (index != (size_t)-1) {
-        // existing aircraft, check if we have a more recent position message
-        aircraft *entry = &aircrafts[index];
-
-        if (entry->latitude != 0u && entry->longitude != 0u) {
-            //locally_unambiguous_position_decoding(entry);
-        }
-
-        if (f == 0 && entry->time_even >= timestamp) {
-            // existing even message is more recent or same age, ignore this one
-            return;
-        }
-        if (f == 1 && entry->time_odd >= timestamp) {
-            // existing odd message is more recent or same age, ignore this one
-            return;
-        }
-    }
-
     lat_cpr /= 131072.0;
     lon_cpr /= 131072.0;
 
@@ -564,8 +545,25 @@ static void handle_airborne_position_baro(uint8_t df, uint8_t ca, uint32_t icao,
                             0u, timestamp);
     }
 
-    index = search_aircraft_by_icao(icao);
-    global_position_decoding(index, n_z, icao);
+    if (index != (size_t)-1) {
+        // existing aircraft, check if we have a more recent position message
+        aircraft *entry = &aircrafts[index];
+
+        if (f == 0 && entry->time_even >= timestamp) {
+            // existing even message is more recent or same age, ignore this one
+            return;
+        }
+        if (f == 1 && entry->time_odd >= timestamp) {
+            // existing odd message is more recent or same age, ignore this one
+            return;
+        }
+
+        if (entry->latitude != 0u && entry->longitude != 0u) {
+            locally_unambiguous_position_decoding(index, icao);
+        } else {
+            global_position_decoding(index, icao);
+        }
+    }   
 
 }
 
