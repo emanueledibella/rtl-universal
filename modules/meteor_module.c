@@ -35,7 +35,15 @@ void meteor_module_reset(meteor_module_t *ctx) {
 }
 
 int meteor_module_set_executable(meteor_module_t *ctx, const char *path) {
-    return ctx && copy_option(ctx->executable, sizeof(ctx->executable), path);
+    size_t length;
+    if (!ctx || !path || path[0] == '\0') return 0;
+    length = strlen(path);
+    if (length >= 4u && strcmp(path + length - 4u, ".app") == 0) {
+        return snprintf(ctx->executable, sizeof(ctx->executable),
+                        "%s/Contents/MacOS/satdump", path)
+               < (int)sizeof(ctx->executable);
+    }
+    return copy_option(ctx->executable, sizeof(ctx->executable), path);
 }
 
 int meteor_module_set_pipeline(meteor_module_t *ctx, const char *name) {
@@ -79,6 +87,58 @@ static void log_command(char *const argv[]) {
     fputs("[METEOR] backend-command:", diagnostics);
     for (size_t i = 0u; argv[i]; i++) fprintf(diagnostics, " %s", argv[i]);
     fputc('\n', diagnostics);
+}
+
+/* SatDump 1.x exposes `satdump live ...`; SatDump 2.x keeps that interface
+ * below `satdump legacy live ...`. Probe the harmless, incomplete `live`
+ * command and recognize the 1.x usage line. */
+static int detect_cli_generation(meteor_module_t *ctx) {
+    int descriptors[2];
+    posix_spawn_file_actions_t actions;
+    pid_t pid;
+    char output[4096];
+    size_t used = 0u;
+    int status = 0;
+    char *probe_argv[3];
+    if (!ctx) return 2;
+    if (ctx->cli_generation == 1 || ctx->cli_generation == 2) {
+        return ctx->cli_generation;
+    }
+    if (pipe(descriptors) != 0) return 2;
+    if (posix_spawn_file_actions_init(&actions) != 0) {
+        close(descriptors[0]);
+        close(descriptors[1]);
+        return 2;
+    }
+    (void)posix_spawn_file_actions_adddup2(&actions, descriptors[1], STDOUT_FILENO);
+    (void)posix_spawn_file_actions_adddup2(&actions, descriptors[1], STDERR_FILENO);
+    (void)posix_spawn_file_actions_addclose(&actions, descriptors[0]);
+    (void)posix_spawn_file_actions_addclose(&actions, descriptors[1]);
+    probe_argv[0] = ctx->executable;
+    probe_argv[1] = "live";
+    probe_argv[2] = NULL;
+    if (posix_spawnp(&pid, ctx->executable, &actions, NULL, probe_argv, environ) != 0) {
+        posix_spawn_file_actions_destroy(&actions);
+        close(descriptors[0]);
+        close(descriptors[1]);
+        return 2;
+    }
+    posix_spawn_file_actions_destroy(&actions);
+    close(descriptors[1]);
+    while (used + 1u < sizeof(output)) {
+        ssize_t count = read(descriptors[0], output + used, sizeof(output) - used - 1u);
+        if (count <= 0) break;
+        used += (size_t)count;
+    }
+    close(descriptors[0]);
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+        /* Retry the interrupted wait. */
+    }
+    output[used] = '\0';
+    ctx->cli_generation = strstr(output, " live [pipeline_id]") != NULL ? 1 : 2;
+    fprintf(output_diagnostics(), "[METEOR] detected SatDump CLI %s\n",
+            ctx->cli_generation == 1 ? "1.x" : "2.x");
+    return ctx->cli_generation;
 }
 
 static int spawn_and_wait(meteor_module_t *ctx, char *const argv[]) {
@@ -126,7 +186,9 @@ int meteor_module_run_live(meteor_module_t *ctx, double frequency_mhz,
     char timeout[32];
     char *argv[32];
     size_t argc = 0u;
+    int cli_generation;
     if (!ctx || frequency_mhz <= 0.0) return 0;
+    cli_generation = detect_cli_generation(ctx);
     snprintf(sample_rate, sizeof(sample_rate), "%u", ctx->sample_rate);
     snprintf(frequency, sizeof(frequency), "%.0f", frequency_mhz * 1e6);
     snprintf(gain, sizeof(gain), "%d", gain_db);
@@ -134,7 +196,7 @@ int meteor_module_run_live(meteor_module_t *ctx, double frequency_mhz,
     snprintf(timeout, sizeof(timeout), "%u", ctx->timeout_seconds);
 
     argv[argc++] = ctx->executable;
-    argv[argc++] = "legacy";
+    if (cli_generation >= 2) argv[argc++] = "legacy";
     argv[argc++] = "live";
     argv[argc++] = ctx->pipeline;
     argv[argc++] = ctx->output_dir;
@@ -173,10 +235,12 @@ int meteor_module_run_offline(meteor_module_t *ctx, const char *input_path) {
     char sample_rate[32];
     char *argv[24];
     size_t argc = 0u;
+    int cli_generation;
     if (!ctx || !input_path || input_path[0] == '\0') return 0;
+    cli_generation = detect_cli_generation(ctx);
     snprintf(sample_rate, sizeof(sample_rate), "%u", ctx->sample_rate);
     argv[argc++] = ctx->executable;
-    argv[argc++] = "pipeline";
+    if (cli_generation >= 2) argv[argc++] = "pipeline";
     argv[argc++] = ctx->pipeline;
     argv[argc++] = "baseband";
     argv[argc++] = (char *)input_path;
@@ -199,9 +263,10 @@ int meteor_module_run_test(meteor_module_t *ctx) {
                  || strcmp(ctx->pipeline, "meteor_m2-x_lrpt_80k") == 0)
              && ctx->output_dir[0] != '\0';
     fprintf(output_diagnostics(),
-            "[METEOR] test_result=%s backend=satdump pipeline=%s samplerate=%u output=%s\n",
-            ok ? "PASS" : "FAIL", ctx ? ctx->pipeline : "-",
-            ctx ? ctx->sample_rate : 0u, ctx ? ctx->output_dir : "-");
+            "[METEOR] test_result=%s backend=%s pipeline=%s samplerate=%u output=%s\n",
+            ok ? "PASS" : "FAIL", ctx ? ctx->executable : "-",
+            ctx ? ctx->pipeline : "-", ctx ? ctx->sample_rate : 0u,
+            ctx ? ctx->output_dir : "-");
     return ok;
 }
 

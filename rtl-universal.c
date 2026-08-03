@@ -372,7 +372,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "  --save-dir <path>   output directory for SSTV/Meteor images\n");
     fprintf(stderr, "  --meteor-pipeline <p> m2|m2-x|m2-x-80k (default: m2-x)\n");
     fprintf(stderr, "  --satellite <name>  Auto|M2|M2-2|M2-3|M2-4\n");
-    fprintf(stderr, "  --satdump <path>    SatDump CLI executable (default: satdump in PATH)\n");
+    fprintf(stderr, "  --satdump <path>    SatDump CLI or .app path (default: satdump in PATH)\n");
     fprintf(stderr, "  --duration <sec>    stop a live Meteor capture after this duration\n");
     fprintf(stderr, "Examples:\n");
     fprintf(stderr, "  %s 145.500 --mode voice --demod fm\n", prog);

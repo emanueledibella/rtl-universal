@@ -13,6 +13,7 @@ typedef struct {
     char satellite[32];
     unsigned int sample_rate;
     unsigned int timeout_seconds;
+    int cli_generation;
 } meteor_module_t;
 
 void meteor_module_reset(meteor_module_t *ctx);

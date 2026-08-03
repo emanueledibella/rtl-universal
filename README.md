@@ -285,9 +285,9 @@ binario CLI `satdump`; per macOS sono disponibili build autonome nella
 # Variante Meteor M2-x con protocollo OQPSK a 80 kbaud
 ./rtl-universal --mode meteor --meteor-pipeline m2-x-80k --freq 137.900
 
-# Forza il satellite M2-4 e indica SatDump quando non è presente nel PATH
+# Forza il satellite M2-4 e indica l'app SatDump quando non è nel PATH
 ./rtl-universal --mode meteor --satellite M2-4 \
-  --satdump /percorso/al/binario/satdump --save-dir immagini-meteor
+  --satdump /Applications/SatDump.app --save-dir immagini-meteor
 
 # Decodifica una registrazione I/Q CU8 a 1 MS/s
 ./rtl-universal --mode meteor --input passaggio.cu8 --input-format iq-u8 \
@@ -303,6 +303,9 @@ Nel comando live `--gain 35` imposta il guadagno del dongle, `--duration 900`
 limita la ricezione a 900 secondi e `--save-dir immagini-meteor` indica dove
 SatDump deve scrivere dati e immagini. Con `--input passaggio.cu8` la sorgente
 non è più il dongle: viene elaborata una registrazione I/Q CU8 a 1 MS/s.
+Su macOS `--satdump` accetta sia `/Applications/SatDump.app` sia il percorso
+completo `/Applications/SatDump.app/Contents/MacOS/satdump`. Il programma
+riconosce automaticamente la sintassi CLI di SatDump 1.x e 2.x.
 
 Le pipeline selezionabili sono `m2` (QPSK 72k), `m2-x` (OQPSK 72k,
 predefinita) e `m2-x-80k` (OQPSK 80k). La frequenza predefinita è 137.900
