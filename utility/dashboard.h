@@ -4,6 +4,7 @@
 
 typedef struct {
     uint32_t icao;
+    uint8_t downlink_format;
     const char *callsign;
     const char *category;
     int altitude_ft;
@@ -19,6 +20,8 @@ typedef struct {
     int has_vertical_rate;
     uint8_t adsb_version;
     int has_adsb_version;
+    uint16_t squawk;
+    int has_squawk;
 } dashboard_adsb_update_t;
 
 typedef struct {
@@ -42,6 +45,21 @@ typedef struct {
     int has_navigation_status;
 } dashboard_ais_update_t;
 
+typedef struct {
+    const char *serial;
+    uint16_t frame_number;
+    double battery_v;
+    int has_battery;
+    double latitude;
+    double longitude;
+    double altitude_m;
+    double speed_mps;
+    double heading_deg;
+    double climb_mps;
+    unsigned int satellites;
+    int has_position;
+} dashboard_sonde_update_t;
+
 void dashboard_set_mode(const char *protocol);
 void dashboard_configure_receiver(const char *protocol, double frequency_mhz,
                                   const char *gain, const char *device);
@@ -54,5 +72,6 @@ void dashboard_update_stats(double signal_dbfs, double clipping_percent,
                             uint64_t other_rejected);
 void dashboard_update_adsb(const dashboard_adsb_update_t *update);
 void dashboard_update_ais(const dashboard_ais_update_t *update);
+void dashboard_update_sonde(const dashboard_sonde_update_t *update);
 void dashboard_force_render(void);
 void dashboard_shutdown(void);

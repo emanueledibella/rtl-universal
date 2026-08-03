@@ -163,25 +163,14 @@ void on_clean_frame(const uint8_t *frame, size_t frame_bits) {
 
 static void on_frame_default(void *user, const uint8_t *frame, size_t frame_bits) {
     adsb_ctx_t *ctx = (adsb_ctx_t *)user;
-    uint8_t df;
     if (!ctx || !frame || (frame_bits != SHORT_FRAME_BITS && frame_bits != LONG_FRAME_BITS)) {
-        return;
-    }
-    df = (uint8_t)(frame[0] >> 3u);
-    if (frame_bits != LONG_FRAME_BITS || (df != 17u && df != 18u)) {
-        ctx->non_adsb_candidate_count++;
-        return;
-    }
-    if (adsb_frame_crc(frame, frame_bits) != 0u) {
-        ctx->rejected_frame_count++;
-        ctx->crc_error_count++;
         return;
     }
     if (adsb_protocol_handle_frame(frame, frame_bits)) {
         ctx->valid_frame_count++;
     } else {
-        /* Defensive: supported frames were already length/CRC checked above. */
         ctx->rejected_frame_count++;
+        ctx->crc_error_count++;
     }
 }
 

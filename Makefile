@@ -24,6 +24,9 @@ strict: clean
 test: $(TARGET)
 	./$(TARGET) --mode adsb --adsb-test --output log
 	./$(TARGET) --mode ais --ais-test --output log
+	./$(TARGET) --mode sonde --test --output log
+	./$(TARGET) --mode sstv --test --output log
+	./$(TARGET) --mode meteor --test --output log
 	./$(TARGET) --mode ads-b --adsb-frame 8D4840D6202CC371C32CE0576098 --output log
 	@./$(TARGET) --mode adsb --adsb-frame 8D4840D6202CC371C32CE0576098 --output dashboard | grep -q '4840D6'
 	./$(TARGET) --ais-nmea '!AIVDM,1,1,,A,13co>HP01p0q=3PGvQd7Dmpt0000,0*7E' --output json

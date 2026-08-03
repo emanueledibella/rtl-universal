@@ -18,6 +18,9 @@
 #include "modules/header/adsb_decoder.h"
 #include "modules/header/adsb_protocol.h"
 #include "modules/header/voice_module.h"
+#include "modules/header/sonde_module.h"
+#include "modules/header/sstv_module.h"
+#include "modules/header/meteor_module.h"
 #include "demod/header/demodulator.h"
 #include "utility/dashboard.h"
 #include "utility/output.h"
@@ -29,6 +32,9 @@ static demodulator_t g_demod;
 static voice_module_t g_voice;
 static ais_receiver_t g_ais;
 static adsb_ctx_t g_adsb;
+static sonde_module_t g_sonde;
+static sstv_module_t g_sstv;
+static meteor_module_t g_meteor;
 
 static int streq_icase(const char *a, const char *b);
 
@@ -98,6 +104,15 @@ static void live_stats_maybe_report(live_stats_t *stats, int force) {
                         + g_ais.channel[i].overflow_frames;
             crc_errors += g_ais.channel[i].crc_errors;
         }
+    } else if (streq_icase(stats->module_name, "sonde")) {
+        valid = g_sonde.frames_valid;
+        rejected = g_sonde.rejected_frames;
+        crc_errors = g_sonde.crc_errors;
+        candidates = g_sonde.frame_candidates;
+    } else if (streq_icase(stats->module_name, "sstv")) {
+        valid = g_sstv.images_saved;
+        rejected = g_sstv.rejected_headers;
+        candidates = g_sstv.vis_headers;
     }
     if (output_is_dashboard()) {
         dashboard_update_stats(
@@ -145,6 +160,7 @@ static void on_sigint(int sig) {
     (void)sig;
     g_stop = 1;
     if (g_dev) rtlsdr_cancel_async(g_dev);
+    meteor_module_stop();
 }
 
 static int streq_icase(const char *a, const char *b) {
@@ -248,10 +264,57 @@ static int adsb_run_test_module(void *ctx) {
     return adsb_test_emit_examples((adsb_ctx_t *)ctx);
 }
 
+static int sonde_init_module(void *ctx, const demod_config_t *cfg) {
+    return sonde_module_init((sonde_module_t *)ctx, cfg);
+}
+
+static void sonde_fill_demod_config_module(void *ctx, demod_config_t *cfg) {
+    sonde_module_get_demod_config((sonde_module_t *)ctx, cfg);
+}
+
+static demod_output_t sonde_get_demod_output_module(void *ctx) {
+    return sonde_module_get_demod_output((sonde_module_t *)ctx);
+}
+
+static void sonde_flush_module(void *ctx) {
+    sonde_module_flush((sonde_module_t *)ctx);
+}
+
+static int sonde_run_test_module(void *ctx) {
+    return sonde_module_run_test((sonde_module_t *)ctx);
+}
+
+static int sstv_init_module(void *ctx, const demod_config_t *cfg) {
+    return sstv_module_init((sstv_module_t *)ctx, cfg);
+}
+
+static void sstv_fill_demod_config_module(void *ctx, demod_config_t *cfg) {
+    sstv_module_get_demod_config((sstv_module_t *)ctx, cfg);
+}
+
+static demod_output_t sstv_get_demod_output_module(void *ctx) {
+    return sstv_module_get_demod_output((sstv_module_t *)ctx);
+}
+
+static void sstv_flush_module(void *ctx) {
+    sstv_module_flush((sstv_module_t *)ctx);
+}
+
+static int sstv_run_test_module(void *ctx) {
+    return sstv_module_run_test((sstv_module_t *)ctx);
+}
+
+static int meteor_run_test_module(void *ctx) {
+    return meteor_module_run_test((meteor_module_t *)ctx);
+}
+
 static const module_ops_t g_modules[] = {
     { "voice", &g_voice, voice_init_module, voice_fill_demod_config_module, voice_get_demod_output_module, voice_flush_module, NULL                 },
     { "ais",   &g_ais,   ais_init_module,   ais_fill_demod_config_module,   ais_get_demod_output_module,   ais_flush_module,   ais_run_test_module  },
     { "adsb",  &g_adsb,  adsb_init_module,  adsb_fill_demod_config_module,  adsb_get_demod_output_module,  adsb_flush_module,  adsb_run_test_module },
+    { "sonde", &g_sonde, sonde_init_module, sonde_fill_demod_config_module, sonde_get_demod_output_module, sonde_flush_module, sonde_run_test_module },
+    { "sstv",  &g_sstv,  sstv_init_module,  sstv_fill_demod_config_module,  sstv_get_demod_output_module,  sstv_flush_module,  sstv_run_test_module },
+    { "meteor", &g_meteor, NULL, NULL, NULL, NULL, meteor_run_test_module },
     { NULL,    NULL,     NULL,              NULL,                            NULL,                           NULL,               NULL                 }
 };
 
@@ -262,6 +325,12 @@ static const module_ops_t *find_module(const char *name) {
     if (streq_icase(name, "ship") || streq_icase(name, "ships")
         || streq_icase(name, "navi") || streq_icase(name, "maritime")) name = "ais";
     if (streq_icase(name, "voce")) name = "voice";
+    if (streq_icase(name, "rs41") || streq_icase(name, "radiosonde")
+        || streq_icase(name, "weather-sonde")) name = "sonde";
+    if (streq_icase(name, "slow-scan-tv") || streq_icase(name, "slow-scan")) {
+        name = "sstv";
+    }
+    if (streq_icase(name, "meteor-lrpt") || streq_icase(name, "lrpt")) name = "meteor";
     for (int i = 0; g_modules[i].name; i++) {
         if (streq_icase(name, g_modules[i].name)) return &g_modules[i];
     }
@@ -269,15 +338,16 @@ static const module_ops_t *find_module(const char *name) {
 }
 
 static void usage(const char *prog) {
-    fprintf(stderr, "Usage: %s [freq_mhz] [gain_db] --mode <voice|ais|adsb> [options]\n", prog);
+    fprintf(stderr, "Usage: %s [freq_mhz] [gain_db] --mode <voice|ais|adsb|sonde|sstv|meteor> [options]\n", prog);
     fprintf(stderr, "       %s --mode ais --ais-test\n", prog);
     fprintf(stderr, "       %s --mode adsb --adsb-test\n", prog);
     fprintf(stderr, "       %s --mode ais --ais-payload <hex>\n", prog);
     fprintf(stderr, "       %s --ais-nmea '<!AIVDM/...>'\n", prog);
     fprintf(stderr, "       %s --mode adsb --adsb-frame <hex>\n", prog);
+    fprintf(stderr, "       %s --mode sonde --sonde-frame <hex>\n", prog);
     fprintf(stderr, "       %s --input <file|-> --input-format <auto|nmea|avr|beast|iq-u8>\n", prog);
     fprintf(stderr, "Options:\n");
-    fprintf(stderr, "  --freq <mhz>        center frequency (defaults: dual AIS 162.000, ADS-B 1090)\n");
+    fprintf(stderr, "  --freq <mhz>        center frequency (defaults: AIS 162.000, ADS-B 1090, RS41 403)\n");
     fprintf(stderr, "  --gain <db>         manual tuner gain; omitted means automatic gain\n");
     fprintf(stderr, "  --ppm <int>         frequency correction (e.g. -20, +35)\n");
     fprintf(stderr, "  --bw <hz>           tuner bandwidth in Hz, 0=automatic\n");
@@ -296,11 +366,21 @@ static void usage(const char *prog) {
     fprintf(stderr, "  --adsb-test         run valid ADS-B identification/position/velocity examples\n");
     fprintf(stderr, "  --ais-payload <hex> decode one packed AIS information payload offline\n");
     fprintf(stderr, "  --ais-nmea <line>   validate and decode one !AIVDM/!AIVDO sentence\n");
-    fprintf(stderr, "  --adsb-frame <hex>  validate and decode one 112-bit ADS-B frame offline\n");
+    fprintf(stderr, "  --adsb-frame <hex>  validate/decode one 56/112-bit Mode S frame offline\n");
+    fprintf(stderr, "  --sonde-frame <hex> decode one de-whitened 320/518-byte RS41 frame\n");
+    fprintf(stderr, "  --sstv-mode <mode>  auto|pd120|martin-m1 (default: auto/VIS)\n");
+    fprintf(stderr, "  --save-dir <path>   output directory for SSTV/Meteor images\n");
+    fprintf(stderr, "  --meteor-pipeline <p> m2|m2-x|m2-x-80k (default: m2-x)\n");
+    fprintf(stderr, "  --satellite <name>  Auto|M2|M2-2|M2-3|M2-4\n");
+    fprintf(stderr, "  --satdump <path>    SatDump CLI executable (default: satdump in PATH)\n");
+    fprintf(stderr, "  --duration <sec>    stop a live Meteor capture after this duration\n");
     fprintf(stderr, "Examples:\n");
     fprintf(stderr, "  %s 145.500 --mode voice --demod fm\n", prog);
     fprintf(stderr, "  %s --mode ais --ppm -20 --bw 100000\n", prog);
     fprintf(stderr, "  %s --mode adsb --lat 41.9 --lon 12.5\n", prog);
+    fprintf(stderr, "  %s --mode sonde --freq 403.000\n", prog);
+    fprintf(stderr, "  %s --mode sstv --freq 145.800 --save-dir images\n", prog);
+    fprintf(stderr, "  %s --mode meteor --freq 137.900 --save-dir meteor-output\n", prog);
 }
 
 static int parse_int_arg(const char *s, int *out) {
@@ -523,6 +603,8 @@ static int open_configured_rtlsdr(rtlsdr_dev_t **out, const char *selector,
 int main(int argc, char **argv) {
     signal(SIGINT, on_sigint);
     voice_module_reset(&g_voice);
+    sstv_module_reset(&g_sstv);
+    meteor_module_reset(&g_meteor);
     adsb_protocol_reset();
 
     if (argc < 2) {
@@ -542,6 +624,13 @@ int main(int argc, char **argv) {
     uint32_t tuner_bw = 0;
     const char *voice_demod = NULL;
     const char *adsb_frame = NULL;
+    const char *sonde_frame = NULL;
+    const char *sstv_mode = NULL;
+    const char *save_dir = NULL;
+    const char *meteor_pipeline = NULL;
+    const char *meteor_satellite = NULL;
+    const char *satdump_path = NULL;
+    int meteor_duration = 0;
     const char *ais_payload = NULL;
     const char *ais_nmea = NULL;
     const char *ais_channels = "both";
@@ -669,6 +758,62 @@ int main(int argc, char **argv) {
             adsb_frame = argv[++i];
             continue;
         }
+        if (strcmp(arg, "--sonde-frame") == 0 || strcmp(arg, "--rs41-frame") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Missing value for %s\n", arg);
+                return 1;
+            }
+            sonde_frame = argv[++i];
+            continue;
+        }
+        if (strcmp(arg, "--sstv-mode") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Missing value for --sstv-mode\n");
+                return 1;
+            }
+            sstv_mode = argv[++i];
+            continue;
+        }
+        if (strcmp(arg, "--save-dir") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Missing value for --save-dir\n");
+                return 1;
+            }
+            save_dir = argv[++i];
+            continue;
+        }
+        if (strcmp(arg, "--meteor-pipeline") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Missing value for --meteor-pipeline\n");
+                return 1;
+            }
+            meteor_pipeline = argv[++i];
+            continue;
+        }
+        if (strcmp(arg, "--satellite") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Missing value for --satellite\n");
+                return 1;
+            }
+            meteor_satellite = argv[++i];
+            continue;
+        }
+        if (strcmp(arg, "--satdump") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Missing value for --satdump\n");
+                return 1;
+            }
+            satdump_path = argv[++i];
+            continue;
+        }
+        if (strcmp(arg, "--duration") == 0) {
+            if (i + 1 >= argc || !parse_int_arg(argv[++i], &meteor_duration)
+                || meteor_duration < 0) {
+                fprintf(stderr, "Invalid or missing value for --duration\n");
+                return 1;
+            }
+            continue;
+        }
         if (strcmp(arg, "--ais-payload") == 0) {
             if (i + 1 >= argc) {
                 fprintf(stderr, "Missing value for --ais-payload\n");
@@ -775,6 +920,7 @@ int main(int argc, char **argv) {
 
     if (!module_name) {
         if (adsb_test || adsb_frame) module_name = "adsb";
+        else if (sonde_frame) module_name = "sonde";
         else if (ais_test || ais_payload || ais_nmea) module_name = "ais";
         else if (input_format == INPUT_FORMAT_NMEA) module_name = "ais";
         else if (input_format == INPUT_FORMAT_AVR || input_format == INPUT_FORMAT_BEAST) {
@@ -806,9 +952,51 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    if (streq_icase(module->name, "voice") && output_is_dashboard()) {
+    if (streq_icase(module->name, "sstv")) {
+        if (!sstv_module_set_mode(&g_sstv, sstv_mode)) {
+            fprintf(stderr, "Invalid --sstv-mode: use auto|pd120|martin-m1\n");
+            return 1;
+        }
+        if (save_dir && !sstv_module_set_save_dir(&g_sstv, save_dir)) {
+            fprintf(stderr, "Invalid --save-dir\n");
+            return 1;
+        }
+    } else if (sstv_mode) {
+        fprintf(stderr, "--sstv-mode works only with mode=sstv\n");
+        return 1;
+    }
+    if (streq_icase(module->name, "meteor")) {
+        if (meteor_pipeline && !meteor_module_set_pipeline(&g_meteor, meteor_pipeline)) {
+            fprintf(stderr, "Invalid --meteor-pipeline: use m2|m2-x|m2-x-80k\n");
+            return 1;
+        }
+        if (meteor_satellite
+            && !meteor_module_set_satellite(&g_meteor, meteor_satellite)) {
+            fprintf(stderr, "Invalid --satellite: use Auto|M2|M2-2|M2-3|M2-4\n");
+            return 1;
+        }
+        if (satdump_path && !meteor_module_set_executable(&g_meteor, satdump_path)) {
+            fprintf(stderr, "Invalid --satdump path\n");
+            return 1;
+        }
+        if (save_dir && !meteor_module_set_output_dir(&g_meteor, save_dir)) {
+            fprintf(stderr, "Invalid --save-dir\n");
+            return 1;
+        }
+        meteor_module_set_timeout(&g_meteor, (unsigned int)meteor_duration);
+    } else if (meteor_pipeline || meteor_satellite || satdump_path || meteor_duration) {
+        fprintf(stderr, "Meteor options work only with mode=meteor\n");
+        return 1;
+    } else if (save_dir && !streq_icase(module->name, "sstv")) {
+        fprintf(stderr, "--save-dir works only with mode=sstv or mode=meteor\n");
+        return 1;
+    }
+
+    if ((streq_icase(module->name, "voice") || streq_icase(module->name, "sstv")
+         || streq_icase(module->name, "meteor"))
+        && output_is_dashboard()) {
         if (output_format_explicit) {
-            fprintf(stderr, "Dashboard output is available for ADS-B and AIS; use --output log for voice\n");
+            fprintf(stderr, "Dashboard output is available for ADS-B, AIS and sondes; use --output log here\n");
             return 1;
         }
         (void)output_set_format_name("log");
@@ -834,6 +1022,10 @@ int main(int argc, char **argv) {
     }
     if (adsb_frame && !streq_icase(module->name, "adsb")) {
         fprintf(stderr, "--adsb-frame works only with mode=adsb\n");
+        return 1;
+    }
+    if (sonde_frame && !streq_icase(module->name, "sonde")) {
+        fprintf(stderr, "--sonde-frame works only with mode=sonde\n");
         return 1;
     }
     if (input_path && input_format == INPUT_FORMAT_NMEA
@@ -879,6 +1071,46 @@ int main(int argc, char **argv) {
         }
     }
 
+    if (streq_icase(module->name, "meteor")) {
+        double meteor_frequency = 137.900;
+        char satdump_device[256];
+        const char *satdump_device_id = NULL;
+        int ok;
+        if (freq_opt && (!parse_double_arg(freq_opt, &meteor_frequency)
+                         || meteor_frequency < 10.0 || meteor_frequency > 4294.0)) {
+            fprintf(stderr, "Invalid Meteor frequency.\n");
+            return 1;
+        }
+        if (device_selector) {
+            int index = resolve_device_index(device_selector);
+            char manufacturer[256];
+            char product[256];
+            char serial[256];
+            if (index >= 0
+                && rtlsdr_get_device_usb_strings((uint32_t)index, manufacturer,
+                                                 product, serial) == 0
+                && serial[0] != '\0') {
+                snprintf(satdump_device, sizeof(satdump_device), "%s", serial);
+            } else {
+                snprintf(satdump_device, sizeof(satdump_device), "%s", device_selector);
+            }
+            satdump_device_id = satdump_device;
+        }
+        if (generic_test) return module->run_test(module->ctx) ? 0 : 1;
+        if (input_path) {
+            if (input_format != INPUT_FORMAT_AUTO && input_format != INPUT_FORMAT_IQ_U8) {
+                fprintf(stderr, "Meteor offline input must use --input-format iq-u8\n");
+                return 1;
+            }
+            ok = meteor_module_run_offline(&g_meteor, input_path);
+        } else {
+            ok = meteor_module_run_live(&g_meteor, meteor_frequency,
+                                        satdump_device_id, use_manual_gain, gain,
+                                        have_ppm, ppm);
+        }
+        return ok ? 0 : 1;
+    }
+
     demod_config_t demod_cfg;
     memset(&demod_cfg, 0, sizeof(demod_cfg));
     module->fill_demod_config(module->ctx, &demod_cfg);
@@ -894,7 +1126,7 @@ int main(int argc, char **argv) {
     }
 
     if (ais_test || adsb_test || generic_test || ais_payload || ais_nmea
-        || adsb_frame || (input_path && input_format != INPUT_FORMAT_IQ_U8)) {
+        || adsb_frame || sonde_frame || (input_path && input_format != INPUT_FORMAT_IQ_U8)) {
         int ok = 1;
         if (ais_test || adsb_test || generic_test) {
             ok = module->run_test && module->run_test(module->ctx) && ok;
@@ -902,6 +1134,7 @@ int main(int argc, char **argv) {
         if (ais_payload) ok = ais_decode_payload_hex(ais_payload) && ok;
         if (ais_nmea) ok = (ais_decode_nmea_sentence(ais_nmea) == 1) && ok;
         if (adsb_frame) ok = adsb_protocol_handle_frame_hex(adsb_frame) && ok;
+        if (sonde_frame) ok = sonde_module_decode_hex(&g_sonde, sonde_frame) && ok;
         if (input_path) ok = process_offline_input(input_path, input_format) && ok;
         module->flush(module->ctx);
         return ok ? 0 : 1;
@@ -929,6 +1162,8 @@ int main(int argc, char **argv) {
             else if (g_ais.selected_channel == 'B') freq_opt = "162.025";
             else freq_opt = "162.000";
         }
+        else if (streq_icase(module->name, "sonde")) freq_opt = "403.000";
+        else if (streq_icase(module->name, "sstv")) freq_opt = "145.800";
         else {
             fprintf(stderr, "Voice mode requires a frequency\n");
             demodulator_flush(&g_demod);

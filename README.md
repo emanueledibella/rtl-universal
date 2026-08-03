@@ -1,6 +1,7 @@
 # rtl-universal
 
-Ricevitore RTL-SDR modulare per voce analogica, AIS navale e ADS-B 1090ES.
+Ricevitore RTL-SDR modulare per voce analogica, AIS navale, ADS-B/Mode S,
+radiosonde RS41, SSTV e immagini satellitari Meteor LRPT.
 La modalità selezionata all'avvio configura frequenza, sample rate,
 demodulatore e decoder; sono disponibili anche input offline e output adatti
 ad altri programmi.
@@ -35,10 +36,20 @@ warning usati come errori.
 
 # ADS-B 1090ES; la posizione aiuta la decodifica CPR locale/surface
 ./rtl-universal --mode adsb --lat 41.9028 --lon 12.4964
+
+# Radiosonda RS41: sostituire 403.000 con la frequenza realmente osservata
+./rtl-universal --mode sonde --freq 403.000 --device 0
+
+# SSTV satellitare/ISS, salva automaticamente le immagini ricevute
+./rtl-universal --mode sstv --freq 145.800 --save-dir immagini-sstv
+
+# Meteor LRPT tramite SatDump, passaggio massimo di 15 minuti
+./rtl-universal --mode meteor --freq 137.900 --duration 900 \
+  --save-dir immagini-meteor
 ```
 
-Per AIS e ADS-B l'output predefinito è una dashboard che si aggiorna sul
-posto: ogni MMSI o ICAO occupa una sola riga e i campi vengono completati
+Per AIS, ADS-B e radiosonde l'output predefinito è una dashboard che si
+aggiorna sul posto: ogni MMSI, ICAO o seriale occupa una sola riga e i campi vengono completati
 quando arrivano nuovi messaggi. La tabella mostra anche età dell'ultimo
 messaggio, numero di messaggi ricevuti, stato del dongle e statistiche del
 segnale. Per tornare al flusso dettagliato riga per riga si usa
@@ -89,9 +100,8 @@ ogni due secondi e tentare la riconnessione dopo una disconnessione:
 Nella dashboard le statistiche compaiono nell'intestazione; con gli altri
 formati sono scritte su `stderr`. Includono stato del ricevitore, potenza
 approssimata in dBFS, clipping e frame/s. In modalità ADS-B mostrano anche
-`candidate_rate` (preamboli candidati al secondo), frame validi, CRC errati,
-candidati con DF diverso da 17/18 e frame respinti per contrasto
-insufficiente. Questi ultimi vengono conteggiati senza riempire il terminale
+`candidate_rate` (preamboli candidati al secondo), frame validi, CRC errati e
+frame respinti per contrasto insufficiente. Questi ultimi vengono conteggiati senza riempire il terminale
 con una riga per ogni scarto. Con `--stats 0` le statistiche vengono
 disabilitate.
 
@@ -124,8 +134,9 @@ esempio `*8D...;`; la variante che inizia con `@` aggiunge un timestamp a
 12 MHz. Beast è il corrispondente flusso binario compatto con timestamp,
 livello del segnale ed escaping del byte `0x1A`. Sono supportati i record
 Beast Mode A/C (tipo 1, ignorato correttamente) e Mode-S corti/lunghi (tipi 2
-e 3); il decoder ADS-B applica poi la validazione CRC e accetta gli extended
-squitter DF17/DF18.
+e 3); il decoder applica CRC o address parity secondo il Downlink Format.
+Sono accettati DF0, 4, 5, 11, 16, 17, 18, 19, 20, 21 e 24, inclusi Comm-B e
+i registri BDS più comuni.
 
 ```sh
 # Input AVR o Beast da file/pipe
@@ -137,8 +148,8 @@ squitter DF17/DF18.
 ./rtl-universal --mode adsb --output beast > frames.beast
 ```
 
-I formati di output disponibili sono `dashboard` (predefinito per AIS e
-ADS-B), `log`, `json`, `csv`, `avr`, `beast` e `quiet`; `table` resta un alias
+I formati di output disponibili sono `dashboard` (predefinito per AIS, ADS-B
+e sonde), `log`, `json`, `csv`, `avr`, `beast` e `quiet`; `table` resta un alias
 di `dashboard`. AVR e Beast sono specifici di ADS-B. Dati decodificati o
 binari vanno su `stdout`; con i formati destinati alle pipe, stato, errori e
 statistiche vanno su `stderr`, così file e flussi non vengono contaminati.
@@ -149,6 +160,9 @@ statistiche vanno su `stderr`, così file e flussi non vengono contaminati.
 # Suite deterministiche senza dongle
 ./rtl-universal --mode ais --ais-test --output log
 ./rtl-universal --mode adsb --adsb-test --output log
+./rtl-universal --mode sonde --test --output log
+./rtl-universal --mode sstv --test --output log
+./rtl-universal --mode meteor --test --output log
 
 # Frame ADS-B 112 bit con validazione CRC
 ./rtl-universal --adsb-frame 8D40621D58C382D690C8AC2863A7
@@ -159,36 +173,169 @@ statistiche vanno su `stderr`, così file e flussi non vengono contaminati.
 # Replay di una registrazione RTL-SDR CU8: I,Q unsigned a 8 bit interlacciati
 ./rtl-universal --mode ais --input registrazione.cu8 --input-format iq-u8
 ./rtl-universal --mode adsb --input registrazione.cu8 --input-format iq-u8
+./rtl-universal --mode sonde --input registrazione-rs41.cu8 --input-format iq-u8
+./rtl-universal --mode sstv --input registrazione-sstv.cu8 --input-format iq-u8
 ```
 
 `--ais-test` verifica NRZI, HDLC, bit de-stuffing, CRC-16, NMEA e i messaggi
 sintetici di posizione/dati viaggio/AtoN. Verifica inoltre il demodulatore con
 due segnali GMSK IQ sintetici simultanei a -25 e +25 kHz, inclusi filtro di
-canale e recupero del timing. `--adsb-test` usa frame 1090ES noti e un burst
-PPM sintetico completo.
+canale e recupero del timing. `--adsb-test` usa frame 1090ES noti, tutti i
+principali Downlink Format Mode S e un burst PPM sintetico completo. Il test
+RS41 attraversa sync, inversione, whitening, correzione Reed–Solomon e CRC
+introducendo deliberatamente quattro simboli errati. Il test SSTV genera una
+trasmissione VIS PD120 e una linea immagine; quello Meteor verifica la scelta
+della pipeline senza richiedere SatDump o il dongle.
 
 Il replay `iq-u8` permette di conservare e aggiungere registrazioni reali di
 regressione senza modificare il codice. Il sample rate della registrazione
 deve coincidere con quello della modalità: 2.4 MS/s per AIS, 2.0 MS/s per
-ADS-B.
+ADS-B, 240 kS/s per RS41/SSTV e 1 MS/s per Meteor LRPT.
+
+## Radiosonde RS41
+
+La modalità `sonde` implementa internamente le Vaisala RS41 a 4800 baud:
+sync GFSK, inversione automatica, de-whitening, due codeword interlacciate
+RS(255,231), CRC-16 dei blocchi, seriale, numero frame, batteria, posizione
+ECEF/GPS, quota, velocità orizzontale, direzione, salita e satelliti. La
+dashboard conserva una riga per ogni seriale.
+
+```sh
+# Ricezione live; 403 MHz è un valore iniziale, non una frequenza universale
+./rtl-universal --mode sonde --freq 403.000 --device 0 --gain 30
+
+# Flusso dettagliato o JSON per altri programmi
+./rtl-universal --mode sonde --freq 402.700 --output log
+./rtl-universal --mode sonde --freq 402.700 --output json
+
+# Frame RS41 già de-whitened, lungo almeno 320 byte, in esadecimale
+./rtl-universal --mode sonde --sonde-frame <hex> --output json
+```
+
+Le radiosonde non trasmettono tutte sulla stessa frequenza e “sonde meteo”
+non indica un unico protocollo. Questa modalità decodifica RS41; M10/M20,
+DFM, RS92 e iMet hanno formati differenti e non vengono etichettati
+erroneamente come RS41. Prima della ricezione conviene individuare il segnale
+nella porzione 400–406 MHz con uno spettro o una scansione locale.
+
+## SSTV
+
+**Tipo di protocollo:** SSTV (Slow Scan Television) è un protocollo analogico
+che trasporta un'immagine attraverso una sequenza di toni audio modulati in
+FM. Non è un flusso video: una singola immagine viene costruita lentamente,
+riga dopo riga. Il codice VIS trasmesso all'inizio identifica il formato
+dell'immagine.
+
+La modalità `sstv` demodula l'audio FM, riconosce l'intestazione VIS e
+decodifica `PD120` (640×496, tipico degli eventi ARISS) e `Martin M1`
+(320×256). Al termine salva un file PPM; la cartella viene creata
+automaticamente. L'autodetect è predefinito, ma si può forzare il modo se il
+VIS è debole o manca.
+
+```sh
+# Ricezione SSTV automatica: riconosce PD120 o Martin M1 dal codice VIS
+./rtl-universal --mode sstv --freq 145.800 --device 0 \
+  --save-dir immagini-sstv
+
+# Forza PD120 quando il codice VIS è assente, debole o disturbato
+./rtl-universal --mode sstv --freq 145.800 --sstv-mode pd120 \
+  --save-dir immagini-sstv --output log
+```
+
+Nel primo comando `--mode sstv` attiva il decoder, `--freq 145.800` imposta
+la frequenza radio, `--device 0` seleziona il primo dongle e `--save-dir`
+indica dove salvare le immagini. La cartella `immagini-sstv` viene creata
+automaticamente. Nel secondo comando `--sstv-mode pd120` disabilita il
+riconoscimento automatico e `--output log` mostra l'avanzamento riga per riga.
+
+`145.800 MHz` è la frequenza comunemente usata dagli eventi SSTV ARISS, ma
+un'immagine arriva solo durante un evento/passaggio realmente attivo. Per
+convertire un PPM in PNG su macOS si può usare:
+
+```sh
+sips -s format png immagini-sstv/file.ppm --out immagini-sstv/file.png
+```
+
+## Meteor LRPT
+
+**Tipo di protocollo:** LRPT (Low Rate Picture Transmission) è un protocollo
+satellitare digitale usato dai satelliti meteorologici Meteor-M per inviare i
+dati dello strumento MSU-MR. Il segnale radio utilizza QPSK oppure OQPSK; `72k`
+e `80k` indicano la velocità in simboli al secondo. Dopo la demodulazione sono
+necessari Viterbi, Reed–Solomon/CCSDS e la ricostruzione dei prodotti immagine.
+
+Meteor LRPT richiede QPSK/OQPSK, recupero di portante e clock, Viterbi,
+Reed–Solomon/CCSDS e decompressione delle immagini MSU-MR. La modalità
+`meteor` delega questa catena al backend SatDump, ma mantiene un solo comando
+di avvio e gli passa tutte le opzioni del ricevitore. Occorre installare il
+binario CLI `satdump`; per macOS sono disponibili build autonome nella
+[pagina ufficiale delle release](https://github.com/SatDump/SatDump/releases).
+
+```sh
+# Live: pipeline OQPSK 72 kbaud, rilevamento automatico del satellite
+./rtl-universal --mode meteor --freq 137.900 --device 0 --gain 35 \
+  --duration 900 --save-dir immagini-meteor
+
+# Meteor M2 originale: protocollo QPSK a 72 kbaud
+./rtl-universal --mode meteor --meteor-pipeline m2 --freq 137.100
+
+# Meteor M2-x: protocollo OQPSK a 72 kbaud (impostazione predefinita)
+./rtl-universal --mode meteor --meteor-pipeline m2-x --freq 137.900
+
+# Variante Meteor M2-x con protocollo OQPSK a 80 kbaud
+./rtl-universal --mode meteor --meteor-pipeline m2-x-80k --freq 137.900
+
+# Forza il satellite M2-4 e indica SatDump quando non è presente nel PATH
+./rtl-universal --mode meteor --satellite M2-4 \
+  --satdump /percorso/al/binario/satdump --save-dir immagini-meteor
+
+# Decodifica una registrazione I/Q CU8 a 1 MS/s
+./rtl-universal --mode meteor --input passaggio.cu8 --input-format iq-u8 \
+  --save-dir immagini-meteor
+```
+
+Le informazioni QPSK/OQPSK e 72/80k vengono inserite scegliendo
+`--meteor-pipeline`: non occorre specificare separatamente modulazione e baud
+rate. `m2` seleziona QPSK 72k, `m2-x` seleziona OQPSK 72k e `m2-x-80k`
+seleziona OQPSK 80k. Se l'opzione viene omessa viene usata `m2-x`.
+
+Nel comando live `--gain 35` imposta il guadagno del dongle, `--duration 900`
+limita la ricezione a 900 secondi e `--save-dir immagini-meteor` indica dove
+SatDump deve scrivere dati e immagini. Con `--input passaggio.cu8` la sorgente
+non è più il dongle: viene elaborata una registrazione I/Q CU8 a 1 MS/s.
+
+Le pipeline selezionabili sono `m2` (QPSK 72k), `m2-x` (OQPSK 72k,
+predefinita) e `m2-x-80k` (OQPSK 80k). La frequenza predefinita è 137.900
+MHz, ma trasmettitore, frequenza e operatività vanno verificati per il
+satellite e il passaggio scelti. SatDump crea nella cartella di output i
+prodotti e le immagini. Il progetto non scarica automaticamente SatDump e
+non nasconde un errore se il backend manca.
 
 ## CRC in breve
 
 Il CRC è un controllo d'integrità calcolato sui bit del messaggio. Il mittente
 allega il risultato e il ricevitore lo ricalcola: se non coincide, il frame è
 quasi certamente alterato da rumore o interferenze e viene scartato. Non è
-cifratura e normalmente non ripara i bit. Qui vengono verificati CRC-24 Mode S
-per ADS-B e CRC-16 HDLC per AIS; i relativi scarti compaiono nelle statistiche.
+cifratura e normalmente non ripara i bit. Qui vengono verificati CRC-24 Mode S,
+CRC-16 HDLC AIS e CRC-16 dei blocchi RS41; i relativi scarti compaiono nelle
+statistiche. La correzione Reed–Solomon RS41, invece, può riparare fino a 12
+simboli errati per codeword prima del controllo CRC.
 
 ## Protocolli implementati
 
 - ADS-B/Mode S: preambolo e PPM a 2 MS/s, frame corti/lunghi, CRC Mode S,
-  DF17/DF18, identificazione, categoria, posizione surface/airborne, CPR
+  DF0/4/5/11/16/17/18/19/20/21/24, address/data parity, Comm-B e BDS
+  1,0/2,0/3,0/4,0/4,4/4,5/5,0/6,0, identificazione, categoria, posizione surface/airborne, CPR
   globale e locale, quota barometrica/GNSS, velocità, vertical rate,
   emergency/squawk, target state e operational status.
 - AIS: due canali simultanei AIS 1/A e AIS 2/B, mixer e filtri separati,
   recupero del timing, GMSK 9.6 ksym/s, NRZI, HDLC, bit de-stuffing, CRC-16,
   NMEA `!AIVDM`/`!AIVDO` mono e multi-frammento e messaggi AIS 1-28.
+- RS41: GFSK 4800 baud, sync/inversione/whitening, Reed–Solomon interlacciato,
+  CRC dei blocchi, stato e navigazione GPS.
+- SSTV: VIS automatico, PD120 e Martin M1, ricostruzione RGB e salvataggio PPM.
+- Meteor LRPT: orchestrazione live/offline delle pipeline SatDump QPSK/OQPSK
+  72/80 kbaud e prodotti MSU-MR.
 
 Mostrare tutte le opzioni:
 
@@ -197,5 +344,7 @@ Mostrare tutte le opzioni:
 ```
 
 Riferimenti di formato: [ITU-R M.1371](https://www.itu.int/rec/R-REC-m.1371/en),
-[NMEA 0183](https://www.nmea.org/nmea-0183.html) e
-[Mode-S Beast data output](https://wiki.jetvision.de/wiki/Mode-S_Beast%3AData_Output_Formats).
+[NMEA 0183](https://www.nmea.org/nmea-0183.html),
+[Mode-S Beast data output](https://wiki.jetvision.de/wiki/Mode-S_Beast%3AData_Output_Formats),
+[SatDump pipelines](https://docs.satdump.org/md_docs_2pages_2Pipelines.html) e
+[ARISS SSTV](https://www.ariss.org/press-releases/ariss-news-release-ariss-sstv-event-scheduled-for-this-week).
