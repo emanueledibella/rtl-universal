@@ -22,6 +22,10 @@ typedef struct {
     uint32_t pulse_count;
     uint64_t detected_preamble_count;
     uint64_t rejected_frame_count;
+    uint64_t quality_rejected_count;
+    uint64_t crc_error_count;
+    uint64_t non_adsb_candidate_count;
+    uint64_t valid_frame_count;
     float mag_history[MAG_HISTORY_LEN];
     uint64_t capture_start_sample;
     uint64_t next_search_sample;
@@ -62,8 +66,10 @@ void feed_clean_bit(adsb_ctx_t *ctx, uint8_t bit);
 void feed_clean_bits(adsb_ctx_t *ctx, const uint8_t *bits, size_t nbits);
 
 // Default conversion hook called for each assembled clean frame.
-// Edit/replace this logic to map bits to your protocol structures.
 void on_clean_frame(const uint8_t *frame, size_t frame_bits);
+
+// Offline deterministic protocol + synthetic PPM path used by --adsb-test.
+int adsb_test_emit_examples(adsb_ctx_t *ctx);
 
 // cleanup/final stats
 void flush(adsb_ctx_t *ctx);

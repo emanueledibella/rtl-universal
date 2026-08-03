@@ -19,6 +19,7 @@ typedef enum {
 
 typedef struct {
     void (*on_bit)(void *user, uint8_t bit);
+    void (*on_channel_bit)(void *user, unsigned int channel, uint8_t bit);
     void (*on_float)(void *user, float sample);
     void *user;
 } demod_output_t;
@@ -32,6 +33,8 @@ typedef struct {
             unsigned int symbol_rate;
             unsigned int m;
             float bt;
+            unsigned int channel_count;
+            float channel_offset_hz[2];
         } gmsk;
         struct {
             float dc_alpha;

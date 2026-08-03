@@ -7,10 +7,31 @@ LDLIBS = -lrtlsdr -lliquid -lportaudio -lusb-1.0 -lm
 TARGET = rtl-universal
 SRC = rtl-universal.c $(wildcard modules/*.c) $(wildcard demod/*.c) $(wildcard utility/*.c)
 
-.PHONY: clean
+.PHONY: all clean strict test
+
+all: $(TARGET)
 
 $(TARGET): $(SRC)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(SRC) -o $@ $(LDFLAGS) $(LDLIBS)
 
 clean:
-	rm -f $(TARGET) rtl-universal antenna.o
+	rm -f $(TARGET) antenna.o
+	rm -rf $(TARGET).dSYM
+
+strict: clean
+	$(MAKE) CFLAGS="$(CFLAGS) -Wall -Wextra -Wpedantic -Werror" all
+
+test: $(TARGET)
+	./$(TARGET) --mode adsb --adsb-test --output log
+	./$(TARGET) --mode ais --ais-test --output log
+	./$(TARGET) --mode ads-b --adsb-frame 8D4840D6202CC371C32CE0576098 --output log
+	@./$(TARGET) --mode adsb --adsb-frame 8D4840D6202CC371C32CE0576098 --output dashboard | grep -q '4840D6'
+	./$(TARGET) --ais-nmea '!AIVDM,1,1,,A,13co>HP01p0q=3PGvQd7Dmpt0000,0*7E' --output json
+	@printf '%s\n' '*8D4840D6202CC371C32CE0576098;' | \
+		./$(TARGET) --input - --input-format avr --output json
+	@printf '%s\n' '@1A000000001A8D4840D6202CC371C32CE0576098;' | \
+		./$(TARGET) --input - --input-format avr --output beast | \
+		./$(TARGET) --input - --input-format beast --output quiet
+	@if ./$(TARGET) --mode adsb --adsb-frame 8D4840D6202CC371C32CE0576099 --output log; then \
+		echo "invalid ADS-B CRC was accepted"; exit 1; \
+	fi

@@ -1,6 +1,6 @@
 #include "header/adsb_decoder.h"
 #include "header/adsb_protocol.h"
-#include "utility.h"
+#include "output.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -10,6 +10,10 @@
 #define MIN_DETECT_SAMPLES 256u
 #define SHORT_FRAME_BITS 56u
 #define LONG_FRAME_BITS 112u
+#define MIN_PREAMBLE_PEAK_TO_NOISE 2.1f
+#define MAX_PREAMBLE_LOW_TO_PEAK 0.82f
+#define MIN_BIT_HIGH_TO_LOW 1.20f
+#define MAX_WEAK_BIT_DIVISOR 8u
 
 static float hist_get(const adsb_ctx_t *ctx, uint64_t sample_index) {
     return ctx->mag_history[sample_index % MAG_HISTORY_LEN];
@@ -54,8 +58,8 @@ static int is_preamble(const adsb_ctx_t *ctx, uint64_t start_sample) {
     if (low_avg < 1e-3f) low_avg = 1e-3f;
 
     if (peak_min < ctx->threshold) return 0;
-    if (high_avg < 2.0f * low_avg) return 0;
-    if (low_max > 0.85f * peak_min) return 0;
+    if (high_avg < MIN_PREAMBLE_PEAK_TO_NOISE * low_avg) return 0;
+    if (low_max > MAX_PREAMBLE_LOW_TO_PEAK * peak_min) return 0;
 
     return 1;
 }
@@ -110,7 +114,8 @@ static int try_emit_captured_frame(adsb_ctx_t *ctx) {
         float hi = max2(early, late);
         float lo = min2(early, late);
 
-        weak[i] = (uint8_t)((hi < 0.75f * ctx->threshold || hi < 1.10f * lo) ? 1u : 0u);
+        weak[i] = (uint8_t)((hi < 0.75f * ctx->threshold
+                             || hi < MIN_BIT_HIGH_TO_LOW * lo) ? 1u : 0u);
         bits[i] = (uint8_t)((early >= late) ? 1u : 0u);
     }
 
@@ -122,6 +127,7 @@ static int try_emit_captured_frame(adsb_ctx_t *ctx) {
     frame_bits = mode_s_frame_bits_from_df(df);
     if (frame_bits == 0u || frame_bits > capture_bits) {
         ctx->rejected_frame_count++;
+        ctx->quality_rejected_count++;
         return 0;
     }
 
@@ -129,8 +135,9 @@ static int try_emit_captured_frame(adsb_ctx_t *ctx) {
         weak_bits += weak[i] ? 1 : 0;
     }
 
-    if (weak_bits > (int)(frame_bits / 4u)) {
+    if (weak_bits > (int)(frame_bits / MAX_WEAK_BIT_DIVISOR)) {
         ctx->rejected_frame_count++;
+        ctx->quality_rejected_count++;
         return 0;
     }
 
@@ -151,47 +158,31 @@ static void pack_bits_to_bytes_msb(const uint8_t *bits, size_t nbits, uint8_t *o
 }
 
 void on_clean_frame(const uint8_t *frame, size_t frame_bits) {
-    size_t frame_bytes = frame_bits / 8u;
-    uint32_t df;
-    uint32_t ca;
-
-    //printf("[adsb] frame bits=%zu bytes=%zu hex=", frame_bits, frame_bytes);
-    for (size_t i = 0; i < frame_bytes; i++) {
-        //printf("%02X", frame[i]);
-    }
-    //printf("\n");
-
-    if (frame_bits < SHORT_FRAME_BITS) {
-        //printf("[adsb] short/incomplete frame\n");
-        return;
-    }
-
-    df = bits_get_u32(frame, 0, 5);
-    ca = bits_get_u32(frame, 5, 3);
-
-    if (frame_bits == LONG_FRAME_BITS) {
-        uint32_t icao = bits_get_u32(frame, 8, 24);
-        uint64_t me = bits_get_u64(frame, 32, 56);
-        uint32_t pi = bits_get_u32(frame, 88, 24);
-        // printf("[adsb] parsed df=%u ca=%u icao=%06X me=%014llX pi=%06X\n",
-        //        df, ca, icao, (unsigned long long)me, pi);
-        protocol_handle_message((uint8_t)df, (uint8_t)ca, icao, me, pi);
-
-        return;
-    }
-
-    {
-        // TODO: parse short frame fields more meaningfully based on DF.
-        uint32_t payload = bits_get_u32(frame, 8, 24);
-        uint32_t parity = bits_get_u32(frame, 32, 24);
-        //printf("[adsb] SHORT FRAME parsed df=%u ca=%u payload=%06X parity=%06X\n",
-        //       df, ca, payload, parity);
-    }
+    (void)adsb_protocol_handle_frame(frame, frame_bits);
 }
 
 static void on_frame_default(void *user, const uint8_t *frame, size_t frame_bits) {
-    (void)user;
-    on_clean_frame(frame, frame_bits);
+    adsb_ctx_t *ctx = (adsb_ctx_t *)user;
+    uint8_t df;
+    if (!ctx || !frame || (frame_bits != SHORT_FRAME_BITS && frame_bits != LONG_FRAME_BITS)) {
+        return;
+    }
+    df = (uint8_t)(frame[0] >> 3u);
+    if (frame_bits != LONG_FRAME_BITS || (df != 17u && df != 18u)) {
+        ctx->non_adsb_candidate_count++;
+        return;
+    }
+    if (adsb_frame_crc(frame, frame_bits) != 0u) {
+        ctx->rejected_frame_count++;
+        ctx->crc_error_count++;
+        return;
+    }
+    if (adsb_protocol_handle_frame(frame, frame_bits)) {
+        ctx->valid_frame_count++;
+    } else {
+        /* Defensive: supported frames were already length/CRC checked above. */
+        ctx->rejected_frame_count++;
+    }
 }
 
 static void emit_frame_from_clean_bits(adsb_ctx_t *ctx) {
@@ -210,8 +201,10 @@ void init(adsb_ctx_t *ctx, int fs_demod) {
     ctx->threshold = 1.6f;      // normalized pulse height over local average
     ctx->frame_bits_target = (int)LONG_FRAME_BITS;
     ctx->on_frame_cb = on_frame_default;
+    ctx->on_frame_user = ctx;
 
-    printf("[adsb] init fs_demod=%d frame_bits_target=%d\n", fs_demod, ctx->frame_bits_target);
+    fprintf(output_diagnostics(), "[adsb] init fs_demod=%d frame_bits_target=%d\n",
+            fs_demod, ctx->frame_bits_target);
 }
 
 void get_demod_config(demod_config_t *cfg) {
@@ -220,7 +213,8 @@ void get_demod_config(demod_config_t *cfg) {
     cfg->kind = DEMOD_KIND_AM;
     cfg->input_fs = 2000000;
     cfg->output_fs = 2000000;
-    cfg->u.am.dc_alpha = 0.0005f;
+    /* Preserve the pulse envelope; process_am_sample maintains its own baseline. */
+    cfg->u.am.dc_alpha = 0.0f;
 }
 
 demod_output_t get_demod_output(adsb_ctx_t *ctx) {
@@ -348,10 +342,77 @@ void process_am_sample(adsb_ctx_t *ctx, float sample) {
 
 void flush(adsb_ctx_t *ctx) {
     if (!ctx) return;
-    printf("[adsb] flush demod_samples=%llu clean_bits=%llu clean_frames=%llu preambles=%llu rejected=%llu\n",
-           (unsigned long long)ctx->demod_sample_count,
-           (unsigned long long)ctx->clean_bit_count,
-           (unsigned long long)ctx->clean_frame_count,
-           (unsigned long long)ctx->detected_preamble_count,
-           (unsigned long long)ctx->rejected_frame_count);
+    fprintf(output_diagnostics(),
+            "[adsb] flush demod_samples=%llu clean_bits=%llu candidates=%llu valid=%llu preambles=%llu crc_errors=%llu non_adsb=%llu quality_rejected=%llu rejected=%llu\n",
+            (unsigned long long)ctx->demod_sample_count,
+            (unsigned long long)ctx->clean_bit_count,
+            (unsigned long long)ctx->clean_frame_count,
+            (unsigned long long)ctx->valid_frame_count,
+            (unsigned long long)ctx->detected_preamble_count,
+            (unsigned long long)ctx->crc_error_count,
+            (unsigned long long)ctx->non_adsb_candidate_count,
+            (unsigned long long)ctx->quality_rejected_count,
+            (unsigned long long)ctx->rejected_frame_count);
+}
+
+int adsb_test_emit_examples(adsb_ctx_t *ctx) {
+    static const uint8_t identification[14] = {
+        0x8D, 0x48, 0x40, 0xD6, 0x20, 0x2C, 0xC3,
+        0x71, 0xC3, 0x2C, 0xE0, 0x57, 0x60, 0x98
+    };
+    static const unsigned int preamble_high[4] = { 0u, 2u, 7u, 9u };
+    uint64_t frames_before;
+    uint64_t preambles_before;
+    uint64_t quality_before;
+    uint64_t valid_before;
+    int protocol_ok;
+    int quality_gate_ok;
+
+    if (!ctx) return 0;
+    protocol_ok = adsb_protocol_emit_test_examples();
+    frames_before = ctx->clean_frame_count;
+
+    /* Establish a stable noise baseline before the synthetic burst. */
+    for (size_t i = 0; i < MIN_DETECT_SAMPLES; i++) process_am_sample(ctx, 10.0f);
+    for (size_t i = 0; i < PREAMBLE_SAMPLES; i++) {
+        float amplitude = 10.0f;
+        for (size_t p = 0; p < sizeof(preamble_high) / sizeof(preamble_high[0]); p++) {
+            if (i == preamble_high[p]) amplitude = 50.0f;
+        }
+        process_am_sample(ctx, amplitude);
+    }
+    for (size_t i = 0; i < LONG_FRAME_BITS; i++) {
+        uint8_t bit = (uint8_t)((identification[i / 8u] >> (7u - (i % 8u))) & 1u);
+        process_am_sample(ctx, bit ? 50.0f : 10.0f);
+        process_am_sample(ctx, bit ? 10.0f : 50.0f);
+    }
+
+    /* A preamble followed by low-contrast data must not reach the decoder. */
+    for (size_t i = 0; i < 64u; i++) process_am_sample(ctx, 10.0f);
+    preambles_before = ctx->detected_preamble_count;
+    quality_before = ctx->quality_rejected_count;
+    valid_before = ctx->valid_frame_count;
+    for (size_t i = 0; i < PREAMBLE_SAMPLES; i++) {
+        float amplitude = 10.0f;
+        for (size_t p = 0; p < sizeof(preamble_high) / sizeof(preamble_high[0]); p++) {
+            if (i == preamble_high[p]) amplitude = 50.0f;
+        }
+        process_am_sample(ctx, amplitude);
+    }
+    for (size_t i = 0; i < LONG_FRAME_BITS; i++) {
+        uint8_t bit = (uint8_t)((identification[i / 8u] >> (7u - (i % 8u))) & 1u);
+        process_am_sample(ctx, bit ? 12.0f : 10.0f);
+        process_am_sample(ctx, bit ? 10.0f : 12.0f);
+    }
+    quality_gate_ok = ctx->detected_preamble_count == preambles_before + 1u
+                      && ctx->quality_rejected_count == quality_before + 1u
+                      && ctx->valid_frame_count == valid_before;
+
+    fprintf(output_diagnostics(), "[ADSB] ppm_test_result=%s decoded=%llu expected=1\n",
+            ctx->clean_frame_count - frames_before == 1u ? "PASS" : "FAIL",
+            (unsigned long long)(ctx->clean_frame_count - frames_before));
+    fprintf(output_diagnostics(), "[ADSB] quality_gate_test=%s\n",
+            quality_gate_ok ? "PASS" : "FAIL");
+    return protocol_ok && ctx->clean_frame_count - frames_before == 1u
+           && quality_gate_ok;
 }

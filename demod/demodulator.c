@@ -33,7 +33,11 @@ int demodulator_init(demodulator_t *ctx, const demod_config_t *config, const dem
         gmsk_cfg.symbol_rate = config->u.gmsk.symbol_rate;
         gmsk_cfg.m = config->u.gmsk.m;
         gmsk_cfg.bt = config->u.gmsk.bt;
-        return gmsk_demod_init(&ctx->u.gmsk, &gmsk_cfg, output->on_bit, output->user);
+        gmsk_cfg.channel_count = config->u.gmsk.channel_count;
+        gmsk_cfg.channel_offset_hz[0] = config->u.gmsk.channel_offset_hz[0];
+        gmsk_cfg.channel_offset_hz[1] = config->u.gmsk.channel_offset_hz[1];
+        return gmsk_demod_init(&ctx->u.gmsk, &gmsk_cfg, output->on_bit,
+                               output->on_channel_bit, output->user);
     }
     case DEMOD_KIND_NONE:
     default:
