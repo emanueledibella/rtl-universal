@@ -49,6 +49,7 @@ int gmsk_demod_init(gmsk_demod_ctx_t *ctx, const gmsk_demod_config_t *cfg,
                     gmsk_demod_channel_output_cb_t out_channel_cb,
                     void *out_user);
 void gmsk_demod_process_raw_iq_u8(gmsk_demod_ctx_t *ctx, const unsigned char *buf, uint32_t len);
+int gmsk_demod_set_frequency_offset(gmsk_demod_ctx_t *ctx, float offset_hz);
 void gmsk_demod_flush(gmsk_demod_ctx_t *ctx);
 int gmsk_demod_self_test(void);
 

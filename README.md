@@ -89,9 +89,10 @@ controller locale e il binario C per acquisizione, DSP e decoder.
 La modalità **Live** acquisisce FFT in parallelo alla decodifica, fino a 60 FPS.
 Per Voice si può scegliere uno span istantaneo fino a 2,4 MHz, mantenendo il
 filtro audio stretto sul canale centrale. Un clic su spettro o waterfall
-sintonizza la frequenza scelta; la barra verticale può anche essere trascinata.
-Il cambio viene applicato al tuner in tempo reale, senza fermare o riavviare la
-sessione Live.
+seleziona la frequenza da decodificare; la barra verticale può anche essere
+trascinata. Questa sintonia è digitale: lo spettro rimane centrato sulla
+frequenza impostata nel campo superiore e il processo Live non viene riavviato.
+La frequenza centrale del tuner cambia soltanto quando si modifica quel campo.
 
 La modalità **Scan** usa `rtl_power` per attraversare un intervallo ampio, per
 esempio 50–1700 MHz, e ricompone progressivamente i blocchi in una mappa unica.
@@ -104,6 +105,12 @@ del tuner, frequenza, FFT e refresh. Il pannello contestuale aggiunge AM/FM,
 sample rate, filtro e squelch per Voice; coordinate per ADS-B; canale AIS;
 formato e cartella di salvataggio per SSTV. Le tabelle ADS-B, AIS e RS41 sono
 alimentate dagli eventi JSON già prodotti dal decoder.
+
+In modalità Voice la banda evidenziata sullo spettro rappresenta la larghezza
+del filtro RF. Trascinando una delle due maniglie la banda si allarga o si
+restringe simmetricamente intorno al canale selezionato; il valore viene
+aggiornato anche nel pannello Controlli e applicato al DSP durante la ricezione,
+senza dover fermare e riavviare la sessione Live.
 
 In Voice, attivazione e soglia dello squelch vengono aggiornate anche durante
 la ricezione. Il pannello mostra sia il livello del canale post-filtro sia lo

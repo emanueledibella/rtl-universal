@@ -120,6 +120,24 @@ void gmsk_demod_process_raw_iq_u8(gmsk_demod_ctx_t *ctx,
     }
 }
 
+int gmsk_demod_set_frequency_offset(gmsk_demod_ctx_t *ctx, float offset_hz) {
+    if (!ctx || ctx->cfg.input_fs <= 0 || !isfinite(offset_hz)) return 0;
+    for (unsigned int i = 0u; i < ctx->cfg.channel_count; i++) {
+        float combined_offset = ctx->cfg.channel_offset_hz[i] + offset_hz;
+        if (fabsf(combined_offset) > 0.5f * (float)ctx->cfg.input_fs) {
+            return 0;
+        }
+    }
+    for (unsigned int i = 0u; i < ctx->cfg.channel_count; i++) {
+        float combined_offset = ctx->cfg.channel_offset_hz[i] + offset_hz;
+        (void)nco_crcf_set_frequency(
+            ctx->channel[i].mixer,
+            TWO_PI_F * combined_offset / (float)ctx->cfg.input_fs);
+        (void)nco_crcf_set_phase(ctx->channel[i].mixer, 0.0f);
+    }
+    return 1;
+}
+
 void gmsk_demod_flush(gmsk_demod_ctx_t *ctx) {
     if (!ctx) return;
     for (unsigned int i = 0; i < GMSK_DEMOD_MAX_CHANNELS; i++) {

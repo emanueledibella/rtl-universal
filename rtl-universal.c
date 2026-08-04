@@ -35,6 +35,7 @@ static volatile int g_stop = 0;
 static _Atomic(rtlsdr_dev_t *) g_dev = NULL;
 static pthread_mutex_t g_dev_lock = PTHREAD_MUTEX_INITIALIZER;
 static _Atomic uint32_t g_current_frequency_hz = 0u;
+static _Atomic int g_input_sample_rate = 0;
 static demodulator_t g_demod;
 static spectrum_analyzer_t *g_spectrum = NULL;
 
@@ -421,7 +422,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "  --stats <sec>       receiver status interval; 0 disables (default: 5)\n");
     fprintf(stderr, "  --spectrum          emit live FFT frames for a GUI\n");
     fprintf(stderr, "  --spectrum-fd <n>   file descriptor for spectrum JSON (default: stdout)\n");
-    fprintf(stderr, "  --control-fd <n>    read live TUNE/SQUELCH commands from this descriptor\n");
+    fprintf(stderr, "  --control-fd <n>    read live TUNE/CHANNEL/FILTER/SQUELCH commands from this descriptor\n");
     fprintf(stderr, "  --fft-size <n>      FFT bins: 256|512|1024|2048|4096 (default: 1024)\n");
     fprintf(stderr, "  --spectrum-fps <n>  spectrum refresh rate, 1..60 (default: 30)\n");
     fprintf(stderr, "  --demod <fm|am>     voice demodulator (default: fm)\n");
@@ -471,6 +472,9 @@ static int parse_double_arg(const char *s, double *out) {
 
 static void runtime_control_handle_line(const char *line) {
     unsigned long requested_frequency = 0ul;
+    unsigned long channel_frequency = 0ul;
+    int filter_width_hz = 0;
+    int filter_type = 0;
     int squelch_enabled = 0;
     double squelch_threshold = 0.0;
 
@@ -499,10 +503,46 @@ static void runtime_control_handle_line(const char *line) {
         atomic_store_explicit(&g_current_frequency_hz,
                               (uint32_t)requested_frequency,
                               memory_order_release);
+        (void)demodulator_set_frequency_offset(&g_demod, 0.0f);
         spectrum_analyzer_set_center_frequency(
             g_spectrum, (uint32_t)requested_frequency);
         fprintf(stderr, "[CONTROL] event=tuned frequency_hz=%lu\n",
                 requested_frequency);
+        return;
+    }
+    if (sscanf(line, "CHANNEL %lu", &channel_frequency) == 1) {
+        uint32_t center_frequency = atomic_load_explicit(
+            &g_current_frequency_hz, memory_order_acquire);
+        int sample_rate = atomic_load_explicit(
+            &g_input_sample_rate, memory_order_relaxed);
+        double offset_hz = (double)channel_frequency
+                           - (double)center_frequency;
+        if (channel_frequency < 10000000ul
+            || channel_frequency > 4294000000ul
+            || sample_rate <= 0
+            || fabs(offset_hz) > 0.5 * (double)sample_rate
+            || !demodulator_set_frequency_offset(&g_demod,
+                                                  (float)offset_hz)) {
+            fprintf(stderr,
+                    "[CONTROL] event=channel-failed reason=outside-span\n");
+            return;
+        }
+        fprintf(stderr,
+                "[CONTROL] event=channel frequency_hz=%lu center_hz=%u offset_hz=%.0f\n",
+                channel_frequency, center_frequency, offset_hz);
+        return;
+    }
+    if (sscanf(line, "FILTER %d %d", &filter_width_hz, &filter_type) == 2) {
+        if (!demodulator_set_filter(&g_demod,
+                                    (analog_filter_type_t)filter_type,
+                                    filter_width_hz)) {
+            fprintf(stderr, "[CONTROL] event=filter-failed\n");
+            return;
+        }
+        fprintf(stderr,
+                "[CONTROL] event=filter width_hz=%d type=%s\n",
+                filter_width_hz,
+                analog_filter_type_name((analog_filter_type_t)filter_type));
         return;
     }
     if (sscanf(line, "SQUELCH %d %lf", &squelch_enabled,
@@ -1542,6 +1582,8 @@ int main(int argc, char **argv) {
     }
     uint32_t freq_hz = (uint32_t)llround(freq_mhz * 1e6);
     atomic_store_explicit(&g_current_frequency_hz, freq_hz,
+                          memory_order_relaxed);
+    atomic_store_explicit(&g_input_sample_rate, demod_cfg.input_fs,
                           memory_order_relaxed);
 
     FILE *spectrum_output = NULL;

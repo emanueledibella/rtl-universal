@@ -49,9 +49,15 @@ typedef struct {
 
 typedef struct {
     demod_kind_t kind;
+    int input_fs;
     _Atomic int squelch_update_pending;
     _Atomic int requested_squelch_enabled;
     _Atomic float requested_squelch_dbfs;
+    _Atomic int frequency_offset_update_pending;
+    _Atomic float requested_frequency_offset_hz;
+    _Atomic int filter_update_pending;
+    _Atomic int requested_filter_type;
+    _Atomic int requested_filter_width_hz;
     union {
         am_demod_ctx_t am;
         fm_demod_ctx_t fm;
@@ -67,6 +73,10 @@ int demodulator_get_squelch_status(const demodulator_t *ctx,
                                    int *open);
 int demodulator_set_squelch(demodulator_t *ctx, int enabled,
                             float threshold_dbfs);
+int demodulator_set_filter(demodulator_t *ctx,
+                           analog_filter_type_t filter_type,
+                           int filter_width_hz);
+int demodulator_set_frequency_offset(demodulator_t *ctx, float offset_hz);
 void demodulator_flush(demodulator_t *ctx);
 
 #ifdef __cplusplus

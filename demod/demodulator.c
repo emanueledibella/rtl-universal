@@ -8,9 +8,15 @@ int demodulator_init(demodulator_t *ctx, const demod_config_t *config, const dem
 
     memset(ctx, 0, sizeof(*ctx));
     ctx->kind = config->kind;
+    ctx->input_fs = config->input_fs;
     atomic_init(&ctx->squelch_update_pending, 0);
     atomic_init(&ctx->requested_squelch_enabled, 0);
     atomic_init(&ctx->requested_squelch_dbfs, 0.0f);
+    atomic_init(&ctx->frequency_offset_update_pending, 0);
+    atomic_init(&ctx->requested_frequency_offset_hz, 0.0f);
+    atomic_init(&ctx->filter_update_pending, 0);
+    atomic_init(&ctx->requested_filter_type, ANALOG_FILTER_NONE);
+    atomic_init(&ctx->requested_filter_width_hz, 0);
 
     switch (config->kind) {
     case DEMOD_KIND_AM: {
@@ -68,6 +74,35 @@ void demodulator_process_raw_iq_u8(demodulator_t *ctx, const unsigned char *buf,
                                               threshold);
         }
     }
+    if (atomic_exchange_explicit(&ctx->frequency_offset_update_pending, 0,
+                                 memory_order_acquire)) {
+        float offset = atomic_load_explicit(
+            &ctx->requested_frequency_offset_hz, memory_order_relaxed);
+        if (ctx->kind == DEMOD_KIND_AM) {
+            (void)analog_frontend_set_frequency_offset(&ctx->u.am.frontend,
+                                                       offset);
+        } else if (ctx->kind == DEMOD_KIND_FM) {
+            (void)analog_frontend_set_frequency_offset(&ctx->u.fm.frontend,
+                                                       offset);
+        } else if (ctx->kind == DEMOD_KIND_GMSK) {
+            (void)gmsk_demod_set_frequency_offset(&ctx->u.gmsk, offset);
+        }
+    }
+    if (atomic_exchange_explicit(&ctx->filter_update_pending, 0,
+                                 memory_order_acquire)) {
+        analog_filter_type_t filter_type = (analog_filter_type_t)
+            atomic_load_explicit(&ctx->requested_filter_type,
+                                 memory_order_relaxed);
+        int filter_width_hz = atomic_load_explicit(
+            &ctx->requested_filter_width_hz, memory_order_relaxed);
+        if (ctx->kind == DEMOD_KIND_AM) {
+            (void)analog_frontend_set_filter(&ctx->u.am.frontend, filter_type,
+                                             filter_width_hz);
+        } else if (ctx->kind == DEMOD_KIND_FM) {
+            (void)analog_frontend_set_filter(&ctx->u.fm.frontend, filter_type,
+                                             filter_width_hz);
+        }
+    }
 
     switch (ctx->kind) {
     case DEMOD_KIND_AM:
@@ -99,6 +134,46 @@ int demodulator_set_squelch(demodulator_t *ctx, int enabled,
     atomic_store_explicit(&ctx->requested_squelch_dbfs, threshold_dbfs,
                           memory_order_relaxed);
     atomic_store_explicit(&ctx->squelch_update_pending, 1,
+                          memory_order_release);
+    return 1;
+}
+
+int demodulator_set_frequency_offset(demodulator_t *ctx, float offset_hz) {
+    if (!ctx || ctx->kind == DEMOD_KIND_NONE || ctx->input_fs <= 0
+        || !isfinite(offset_hz)
+        || fabsf(offset_hz) > 0.5f * (float)ctx->input_fs) {
+        return 0;
+    }
+    if (ctx->kind == DEMOD_KIND_GMSK) {
+        for (unsigned int i = 0u; i < ctx->u.gmsk.cfg.channel_count; i++) {
+            float combined = ctx->u.gmsk.cfg.channel_offset_hz[i] + offset_hz;
+            if (fabsf(combined) > 0.5f * (float)ctx->input_fs) return 0;
+        }
+    }
+    atomic_store_explicit(&ctx->requested_frequency_offset_hz, offset_hz,
+                          memory_order_relaxed);
+    atomic_store_explicit(&ctx->frequency_offset_update_pending, 1,
+                          memory_order_release);
+    return 1;
+}
+
+int demodulator_set_filter(demodulator_t *ctx,
+                           analog_filter_type_t filter_type,
+                           int filter_width_hz) {
+    if (!ctx || (ctx->kind != DEMOD_KIND_AM && ctx->kind != DEMOD_KIND_FM)
+        || ctx->input_fs <= 0
+        || filter_type < ANALOG_FILTER_NONE
+        || filter_type > ANALOG_FILTER_IIR
+        || filter_width_hz < 0 || filter_width_hz >= ctx->input_fs
+        || (filter_type == ANALOG_FILTER_NONE && filter_width_hz != 0)
+        || (filter_type != ANALOG_FILTER_NONE && filter_width_hz == 0)) {
+        return 0;
+    }
+    atomic_store_explicit(&ctx->requested_filter_type, (int)filter_type,
+                          memory_order_relaxed);
+    atomic_store_explicit(&ctx->requested_filter_width_hz, filter_width_hz,
+                          memory_order_relaxed);
+    atomic_store_explicit(&ctx->filter_update_pending, 1,
                           memory_order_release);
     return 1;
 }

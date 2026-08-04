@@ -52,13 +52,13 @@
               <option value="sstv">SSTV</option>
             </select>
           </label>
-          <label class="frequency-field">
+          <div class="frequency-field">
             <span>Frequenza centrale</span>
-            <div class="frequency-input-wrap">
-              <input id="frequency-input" type="number" min="10" max="1766" step="0.001" value="145.500" />
-              <b>MHz</b>
+            <div id="frequency-editor" class="frequency-editor" role="group" aria-label="Frequenza centrale, editor a cifre da gigahertz a hertz">
+              <div id="frequency-digits" class="frequency-digits"></div>
             </div>
-          </label>
+            <input id="frequency-input" type="hidden" value="145.500" />
+          </div>
           <div class="span-readout">
             <span>Span istantaneo</span>
             <strong id="span-label">2.400 MHz</strong>
@@ -102,10 +102,6 @@
         <section class="visual-column">
           <article class="visual-card glass-panel">
             <div class="card-heading">
-              <div>
-                <span class="eyebrow" id="visual-eyebrow">Analizzatore live</span>
-                <h1 id="visual-title">145.500 <small>MHz</small></h1>
-              </div>
               <div class="visual-metrics">
                 <div><span>Picco</span><strong id="peak-value">— dBFS</strong></div>
                 <div><span>Refresh</span><strong id="fps-value">— FPS</strong></div>
@@ -114,8 +110,13 @@
             </div>
 
             <div id="live-visual" class="canvas-stack">
-              <div class="canvas-label"><span>Spettro</span><span>Clicca o trascina la barra per sintonizzare</span></div>
+              <div class="canvas-label"><span>Spettro</span><span>Clic/drag: seleziona il canale · centro fisso</span></div>
               <canvas id="spectrum-canvas" aria-label="Spettro radio live"></canvas>
+              <div id="filter-passband" class="filter-passband hidden" aria-label="Larghezza del filtro Voice">
+                <button id="filter-handle-left" class="filter-handle filter-handle-left" type="button" aria-label="Ridimensiona il filtro dal lato sinistro"></button>
+                <output id="filter-passband-label">15.0 kHz</output>
+                <button id="filter-handle-right" class="filter-handle filter-handle-right" type="button" aria-label="Ridimensiona il filtro dal lato destro"></button>
+              </div>
               <div class="canvas-divider">
                 <span>Waterfall</span>
                 <div class="gradient-legend"><small>−120</small><i></i><small>0 dBFS</small></div>
@@ -156,7 +157,7 @@
           </article>
         </section>
 
-        <aside class="inspector glass-panel">
+        <aside id="receiver-controls" class="inspector glass-panel">
           <div class="inspector-heading">
             <div>
               <span class="eyebrow">Ricevitore</span>

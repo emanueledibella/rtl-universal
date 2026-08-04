@@ -21,6 +21,9 @@ typedef struct {
 
 typedef struct {
     analog_frontend_config_t cfg;
+    int sample_rate;
+    float frequency_offset_hz;
+    nco_crcf mixer;
     firfilt_crcf fir;
     iirfilt_crcf iir;
     float power_estimate;
@@ -36,6 +39,11 @@ int analog_frontend_process(analog_frontend_t *ctx, float i, float q,
                             float *filtered_i, float *filtered_q);
 int analog_frontend_set_squelch(analog_frontend_t *ctx, int enabled,
                                 float threshold_dbfs);
+int analog_frontend_set_filter(analog_frontend_t *ctx,
+                               analog_filter_type_t filter_type,
+                               int filter_width_hz);
+int analog_frontend_set_frequency_offset(analog_frontend_t *ctx,
+                                         float offset_hz);
 int analog_frontend_get_squelch_status(const analog_frontend_t *ctx,
                                        float *level_dbfs,
                                        float *threshold_dbfs,

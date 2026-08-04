@@ -219,7 +219,12 @@ async function startLive(config) {
     child,
     control: child.stdio[4],
     stopping: false,
-    config: { ...config, protocol, frequencyMhz },
+    config: {
+      ...config,
+      protocol,
+      frequencyMhz,
+      channelFrequencyMhz: frequencyMhz,
+    },
   };
   activeSession = session;
   trackChild(child, session);
@@ -251,6 +256,16 @@ async function startLive(config) {
     if (tuned) {
       broadcast({ type: 'tuned', sessionId: session.id, frequency_hz: Number(tuned[1]) });
     }
+    const channel = trimmed.match(/\[CONTROL] event=channel frequency_hz=(\d+) center_hz=(\d+) offset_hz=([-+\d.]+)/);
+    if (channel) {
+      broadcast({
+        type: 'channel_tuned',
+        sessionId: session.id,
+        frequency_hz: Number(channel[1]),
+        center_hz: Number(channel[2]),
+        offset_hz: Number(channel[3]),
+      });
+    }
     broadcast({ type: 'diagnostic', level: /error|failed|invalid/i.test(trimmed) ? 'error' : 'info', source: 'receiver', message: trimmed });
   });
   attachLineReader(child.stdio[3], (line) => {
@@ -258,7 +273,16 @@ async function startLive(config) {
       const payload = JSON.parse(line);
       if (!session.seenSpectrum) {
         session.seenSpectrum = true;
-        updateState({ mode: 'live', status: 'receiving', sessionId: session.id, protocol, frequencyMhz });
+        updateState({
+          mode: 'live',
+          status: 'receiving',
+          sessionId: session.id,
+          protocol,
+          frequencyMhz,
+          channelFrequencyMhz: session.config.channelFrequencyMhz,
+          filterWidth: protocol === 'voice' ? Number(session.config.filterWidth || 15000) : null,
+          filterType: protocol === 'voice' ? String(session.config.filterType || 'iir') : null,
+        });
       }
       broadcast({ ...payload, sessionId: session.id });
     } catch {
@@ -266,7 +290,16 @@ async function startLive(config) {
     }
   });
 
-  updateState({ mode: 'live', status: 'starting', sessionId: session.id, protocol, frequencyMhz });
+  updateState({
+    mode: 'live',
+    status: 'starting',
+    sessionId: session.id,
+    protocol,
+    frequencyMhz,
+    channelFrequencyMhz: frequencyMhz,
+    filterWidth: protocol === 'voice' ? Number(session.config.filterWidth || 15000) : null,
+    filterType: protocol === 'voice' ? String(session.config.filterType || 'iir') : null,
+  });
   return { sessionId: session.id, args };
 }
 
@@ -283,14 +316,53 @@ function tuneLive(config) {
   const frequencyMhz = finiteNumber(config.frequencyMhz, 'frequency', 10, 1766);
   const session = writeLiveControl(`TUNE ${Math.round(frequencyMhz * 1e6)}`);
   session.config.frequencyMhz = frequencyMhz;
+  session.config.channelFrequencyMhz = frequencyMhz;
   updateState({
     mode: 'live',
     status: 'receiving',
     sessionId: session.id,
     protocol: session.config.protocol,
     frequencyMhz,
+    channelFrequencyMhz: frequencyMhz,
   });
   return { sessionId: session.id, frequencyMhz };
+}
+
+function liveSampleRate(config) {
+  if (config.protocol === 'voice') return Number(config.sampleRate || 2_400_000);
+  return {
+    adsb: 2_000_000,
+    ais: 2_400_000,
+    sonde: 240_000,
+    sstv: 240_000,
+  }[config.protocol] || 2_400_000;
+}
+
+function selectLiveChannel(config) {
+  const frequencyMhz = finiteNumber(config.frequencyMhz, 'channel frequency', 10, 1766);
+  const session = activeSession;
+  if (!session || session.kind !== 'live') throw new Error('No active Live session');
+  const centerMhz = Number(session.config.frequencyMhz);
+  const halfSpanMhz = liveSampleRate(session.config) / 2e6;
+  if (Math.abs(frequencyMhz - centerMhz) > halfSpanMhz) {
+    throw new Error('Channel frequency is outside the current spectrum span');
+  }
+  writeLiveControl(`CHANNEL ${Math.round(frequencyMhz * 1e6)}`);
+  session.config.channelFrequencyMhz = frequencyMhz;
+  updateState({
+    mode: 'live',
+    status: 'receiving',
+    sessionId: session.id,
+    protocol: session.config.protocol,
+    frequencyMhz: centerMhz,
+    channelFrequencyMhz: frequencyMhz,
+  });
+  return {
+    sessionId: session.id,
+    frequencyMhz,
+    centerMhz,
+    offsetHz: Math.round((frequencyMhz - centerMhz) * 1e6),
+  };
 }
 
 function setLiveSquelch(config) {
@@ -304,6 +376,25 @@ function setLiveSquelch(config) {
   session.config.squelchEnabled = enabled;
   session.config.squelchDbfs = thresholdDbfs;
   return { sessionId: session.id, enabled, thresholdDbfs };
+}
+
+function setLiveFilter(config) {
+  const session = activeSession;
+  if (!session || session.kind !== 'live' || session.config.protocol !== 'voice') {
+    throw new Error('Filter control requires an active Voice session');
+  }
+  const sampleRate = integerNumber(session.config.sampleRate ?? 2_400_000,
+    'sample rate', 225001, 3200000);
+  const widthHz = integerNumber(config.widthHz, 'filter width', 1000,
+    sampleRate - 1);
+  const type = optionalText(config.type, session.config.filterType || 'iir').toLowerCase();
+  const typeCode = { fir: 1, iir: 2 }[type];
+  if (!typeCode) throw new Error('Filter type must be fir or iir');
+  writeLiveControl(`FILTER ${widthHz} ${typeCode}`);
+  session.config.filterWidth = widthHz;
+  session.config.filterType = type;
+  updateState({ filterWidth: widthHz, filterType: type });
+  return { sessionId: session.id, widthHz, type };
 }
 
 function parseRtlPowerLine(line, config, session) {
@@ -454,8 +545,16 @@ const server = createServer(async (request, response) => {
       sendJson(response, 202, tuneLive(await readJsonBody(request)));
       return;
     }
+    if (request.method === 'POST' && url.pathname === '/api/live/channel') {
+      sendJson(response, 202, selectLiveChannel(await readJsonBody(request)));
+      return;
+    }
     if (request.method === 'POST' && url.pathname === '/api/live/squelch') {
       sendJson(response, 202, setLiveSquelch(await readJsonBody(request)));
+      return;
+    }
+    if (request.method === 'POST' && url.pathname === '/api/live/filter') {
+      sendJson(response, 202, setLiveFilter(await readJsonBody(request)));
       return;
     }
     if (request.method === 'POST' && url.pathname === '/api/scan/start') {

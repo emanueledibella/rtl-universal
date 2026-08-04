@@ -110,6 +110,64 @@ static int test_runtime_squelch(void) {
     return open;
 }
 
+static int test_runtime_filter(void) {
+    analog_frontend_config_t cfg = {
+        ANALOG_FILTER_IIR, TEST_FILTER_WIDTH, 0, 0.0f
+    };
+    analog_frontend_t frontend;
+
+    if (!analog_frontend_init(&frontend, &cfg, TEST_SAMPLE_RATE)) return 0;
+    if (!analog_frontend_set_filter(&frontend, ANALOG_FILTER_FIR, 25000)
+        || frontend.cfg.filter_type != ANALOG_FILTER_FIR
+        || frontend.cfg.filter_width_hz != 25000
+        || !frontend.fir || frontend.iir
+        || analog_frontend_set_filter(&frontend, ANALOG_FILTER_IIR,
+                                      TEST_SAMPLE_RATE)
+        || analog_frontend_set_filter(&frontend, ANALOG_FILTER_NONE, 1000)
+        || !analog_frontend_set_filter(&frontend, ANALOG_FILTER_IIR, 15000)
+        || frontend.cfg.filter_type != ANALOG_FILTER_IIR
+        || frontend.cfg.filter_width_hz != 15000
+        || frontend.fir || !frontend.iir) {
+        analog_frontend_destroy(&frontend);
+        return 0;
+    }
+    analog_frontend_destroy(&frontend);
+    return 1;
+}
+
+static int test_frequency_offset(void) {
+    analog_frontend_config_t cfg = {
+        ANALOG_FILTER_IIR, TEST_FILTER_WIDTH, 0, 0.0f
+    };
+    analog_frontend_t frontend;
+    float filtered_i = 0.0f;
+    float filtered_q = 0.0f;
+    float power = 0.0f;
+    const float tone_hz = 30000.0f;
+
+    if (!analog_frontend_init(&frontend, &cfg, TEST_SAMPLE_RATE)) return 0;
+    if (!analog_frontend_set_frequency_offset(&frontend, tone_hz)
+        || analog_frontend_set_frequency_offset(
+            &frontend, (float)TEST_SAMPLE_RATE)) {
+        analog_frontend_destroy(&frontend);
+        return 0;
+    }
+    for (int n = 0; n < 12000; n++) {
+        float phase = 2.0f * TEST_PI_F * tone_hz
+                      * (float)n / (float)TEST_SAMPLE_RATE;
+        (void)analog_frontend_process(&frontend,
+                                      100.0f * cosf(phase),
+                                      100.0f * sinf(phase),
+                                      &filtered_i, &filtered_q);
+        if (n >= 2000) {
+            power += filtered_i * filtered_i + filtered_q * filtered_q;
+        }
+    }
+    analog_frontend_destroy(&frontend);
+    power /= 10000.0f;
+    return power > 8000.0f && power < 12000.0f;
+}
+
 int main(void) {
     analog_frontend_config_t invalid = {ANALOG_FILTER_NONE, 1000, 0, 0.0f};
     analog_frontend_t frontend;
@@ -135,6 +193,14 @@ int main(void) {
         fprintf(stderr, "runtime squelch update test failed\n");
         return 1;
     }
-    puts("[ANALOG] frontend filter/squelch test_result=PASS");
+    if (!test_runtime_filter()) {
+        fprintf(stderr, "runtime filter update test failed\n");
+        return 1;
+    }
+    if (!test_frequency_offset()) {
+        fprintf(stderr, "frequency-offset mixer test failed\n");
+        return 1;
+    }
+    puts("[ANALOG] frontend filter/squelch/mixer test_result=PASS");
     return 0;
 }
