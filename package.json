@@ -1,0 +1,10 @@
+{
+  "name": "rtl-universal-studio",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "start": "node ui/server.mjs",
+    "check": "node --check ui/server.mjs && node --check ui/app.js"
+  }
+}

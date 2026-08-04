@@ -2,6 +2,8 @@
 
 #include <stdint.h>
 
+#include "analog_frontend.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -12,6 +14,7 @@ typedef struct {
     int input_fs;
     int output_fs;
     float dc_alpha;
+    analog_frontend_config_t frontend;
 } fm_demod_config_t;
 
 typedef struct {
@@ -22,6 +25,7 @@ typedef struct {
     float prev_q;
     int have_prev;
     float dc_estimate;
+    analog_frontend_t frontend;
     int decim;
     int decim_count;
     float decim_acc;

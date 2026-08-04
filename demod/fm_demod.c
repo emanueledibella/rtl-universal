@@ -25,6 +25,10 @@ int fm_demod_init(fm_demod_ctx_t *ctx, const fm_demod_config_t *cfg,
     ctx->out_cb = out_cb;
     ctx->out_user = out_user;
     ctx->decim = decim;
+    if (!analog_frontend_init(&ctx->frontend, &cfg->frontend, cfg->input_fs)) {
+        memset(ctx, 0, sizeof(*ctx));
+        return 0;
+    }
     return 1;
 }
 
@@ -35,6 +39,7 @@ void fm_demod_process_raw_iq_u8(fm_demod_ctx_t *ctx, const unsigned char *buf, u
         float i = (float)((int32_t)buf[p] - 127);
         float q = (float)((int32_t)buf[p + 1] - 127);
         float demod = 0.0f;
+        int squelch_open = analog_frontend_process(&ctx->frontend, i, q, &i, &q);
 
         if (!ctx->have_prev) {
             ctx->prev_i = i;
@@ -55,7 +60,8 @@ void fm_demod_process_raw_iq_u8(fm_demod_ctx_t *ctx, const unsigned char *buf, u
         ctx->decim_acc += demod;
         ctx->decim_count++;
         if (ctx->decim_count >= ctx->decim) {
-            ctx->out_cb(ctx->out_user, ctx->decim_acc / (float)ctx->decim_count);
+            float output = ctx->decim_acc / (float)ctx->decim_count;
+            ctx->out_cb(ctx->out_user, squelch_open ? output : 0.0f);
             ctx->decim_acc = 0.0f;
             ctx->decim_count = 0;
         }
@@ -64,9 +70,11 @@ void fm_demod_process_raw_iq_u8(fm_demod_ctx_t *ctx, const unsigned char *buf, u
 
 void fm_demod_flush(fm_demod_ctx_t *ctx) {
     if (!ctx || !ctx->out_cb) return;
-    if (ctx->decim_count <= 0) return;
-
-    ctx->out_cb(ctx->out_user, ctx->decim_acc / (float)ctx->decim_count);
-    ctx->decim_acc = 0.0f;
-    ctx->decim_count = 0;
+    if (ctx->decim_count > 0) {
+        float output = ctx->decim_acc / (float)ctx->decim_count;
+        ctx->out_cb(ctx->out_user, ctx->frontend.squelch_open ? output : 0.0f);
+        ctx->decim_acc = 0.0f;
+        ctx->decim_count = 0;
+    }
+    analog_frontend_destroy(&ctx->frontend);
 }

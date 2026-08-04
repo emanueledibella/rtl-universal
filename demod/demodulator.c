@@ -15,6 +15,7 @@ int demodulator_init(demodulator_t *ctx, const demod_config_t *config, const dem
         am_cfg.input_fs = config->input_fs;
         am_cfg.output_fs = config->output_fs;
         am_cfg.dc_alpha = config->u.am.dc_alpha;
+        am_cfg.frontend = config->analog;
         return am_demod_init(&ctx->u.am, &am_cfg, output->on_float, output->user);
     }
     case DEMOD_KIND_FM: {
@@ -23,6 +24,7 @@ int demodulator_init(demodulator_t *ctx, const demod_config_t *config, const dem
         fm_cfg.input_fs = config->input_fs;
         fm_cfg.output_fs = config->output_fs;
         fm_cfg.dc_alpha = config->u.fm.dc_alpha;
+        fm_cfg.frontend = config->analog;
         return fm_demod_init(&ctx->u.fm, &fm_cfg, output->on_float, output->user);
     }
     case DEMOD_KIND_GMSK: {
@@ -61,6 +63,27 @@ void demodulator_process_raw_iq_u8(demodulator_t *ctx, const unsigned char *buf,
     case DEMOD_KIND_NONE:
     default:
         break;
+    }
+}
+
+int demodulator_get_squelch_status(const demodulator_t *ctx,
+                                   float *level_dbfs,
+                                   float *threshold_dbfs,
+                                   int *open) {
+    if (!ctx) return 0;
+    switch (ctx->kind) {
+    case DEMOD_KIND_AM:
+        return analog_frontend_get_squelch_status(&ctx->u.am.frontend,
+                                                  level_dbfs,
+                                                  threshold_dbfs, open);
+    case DEMOD_KIND_FM:
+        return analog_frontend_get_squelch_status(&ctx->u.fm.frontend,
+                                                  level_dbfs,
+                                                  threshold_dbfs, open);
+    case DEMOD_KIND_GMSK:
+    case DEMOD_KIND_NONE:
+    default:
+        return 0;
     }
 }
 

@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include <rtl-sdr.h>
 
@@ -24,10 +25,12 @@
 #include "demod/header/demodulator.h"
 #include "utility/dashboard.h"
 #include "utility/output.h"
+#include "utility/spectrum.h"
 
 static volatile int g_stop = 0;
 static rtlsdr_dev_t *g_dev = NULL;
 static demodulator_t g_demod;
+static spectrum_analyzer_t *g_spectrum = NULL;
 
 static voice_module_t g_voice;
 static ais_receiver_t g_ais;
@@ -77,6 +80,10 @@ static void live_stats_maybe_report(live_stats_t *stats, int force) {
     uint64_t candidates = 0u;
     uint64_t non_adsb = 0u;
     uint64_t quality_rejected = 0u;
+    float squelch_level_dbfs = -INFINITY;
+    float squelch_threshold_dbfs = -INFINITY;
+    int squelch_open = 0;
+    int have_squelch_status = 0;
 
     if (!stats || stats->stats_interval <= 0.0) return;
     if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return;
@@ -113,6 +120,10 @@ static void live_stats_maybe_report(live_stats_t *stats, int force) {
         valid = g_sstv.images_saved;
         rejected = g_sstv.rejected_headers;
         candidates = g_sstv.vis_headers;
+    } else if (streq_icase(stats->module_name, "voice")) {
+        have_squelch_status = demodulator_get_squelch_status(
+            &g_demod, &squelch_level_dbfs, &squelch_threshold_dbfs,
+            &squelch_open);
     }
     if (output_is_dashboard()) {
         dashboard_update_stats(
@@ -130,6 +141,11 @@ static void live_stats_maybe_report(live_stats_t *stats, int force) {
                 (unsigned long long)valid, (unsigned long long)crc_errors,
                 (unsigned long long)non_adsb,
                 (unsigned long long)quality_rejected);
+    } else if (have_squelch_status) {
+        fprintf(stderr,
+                "[RX] state=receiving signal_raw=%.1f dBFS clipping=%.2f%% channel=%.1f dBFS squelch_threshold=%.1f dBFS squelch=%s\n",
+                signal_dbfs, clipping, squelch_level_dbfs,
+                squelch_threshold_dbfs, squelch_open ? "open" : "closed");
     } else {
         fprintf(stderr,
                 "[RX] state=receiving signal=%.1f dBFS clipping=%.2f%% frame_rate=%.2f/s valid=%llu crc_errors=%llu demod_or_other_rejected=%llu\n",
@@ -187,9 +203,36 @@ static const char *demod_kind_name(demod_kind_t kind) {
     }
 }
 
+static const char *analog_filter_type_name(analog_filter_type_t type) {
+    switch (type) {
+    case ANALOG_FILTER_FIR:
+        return "fir";
+    case ANALOG_FILTER_IIR:
+        return "iir";
+    case ANALOG_FILTER_NONE:
+    default:
+        return "none";
+    }
+}
+
+static int parse_analog_filter_type(const char *name, analog_filter_type_t *type) {
+    if (!name || !type) return 0;
+    if (streq_icase(name, "none") || streq_icase(name, "off")) {
+        *type = ANALOG_FILTER_NONE;
+    } else if (streq_icase(name, "fir") || streq_icase(name, "kaiser")) {
+        *type = ANALOG_FILTER_FIR;
+    } else if (streq_icase(name, "iir") || streq_icase(name, "butterworth")) {
+        *type = ANALOG_FILTER_IIR;
+    } else {
+        return 0;
+    }
+    return 1;
+}
+
 static void rtlsdr_cb(unsigned char *buf, uint32_t len, void *ctx) {
     live_stats_t *stats = (live_stats_t *)ctx;
     if (g_stop) return;
+    if (g_spectrum) spectrum_analyzer_feed_u8(g_spectrum, buf, len);
     if (stats) {
         for (uint32_t p = 0; p + 1u < len; p += 2u) {
             double i = (double)buf[p] - 127.5;
@@ -351,10 +394,18 @@ static void usage(const char *prog) {
     fprintf(stderr, "  --gain <db>         manual tuner gain; omitted means automatic gain\n");
     fprintf(stderr, "  --ppm <int>         frequency correction (e.g. -20, +35)\n");
     fprintf(stderr, "  --bw <hz>           tuner bandwidth in Hz, 0=automatic\n");
+    fprintf(stderr, "  --sample-rate <hz>  live voice input rate (e.g. 2400000 for a wide spectrum)\n");
+    fprintf(stderr, "  --filter-width <hz> voice RF filter width, 0=off (default: off)\n");
+    fprintf(stderr, "  --filter-type <t>   voice channel filter: fir|iir|none (default: fir when width is set)\n");
+    fprintf(stderr, "  --squelch <dbfs>    voice squelch threshold, -120..0 dBFS or off\n");
     fprintf(stderr, "  --device <index|serial> select an RTL-SDR (default: index 0)\n");
     fprintf(stderr, "  --list-devices      list available RTL-SDR receivers and exit\n");
     fprintf(stderr, "  --reconnect <sec>   retry after a receiver/disconnect error\n");
     fprintf(stderr, "  --stats <sec>       receiver status interval; 0 disables (default: 5)\n");
+    fprintf(stderr, "  --spectrum          emit live FFT frames for a GUI\n");
+    fprintf(stderr, "  --spectrum-fd <n>   file descriptor for spectrum JSON (default: stdout)\n");
+    fprintf(stderr, "  --fft-size <n>      FFT bins: 256|512|1024|2048|4096 (default: 1024)\n");
+    fprintf(stderr, "  --spectrum-fps <n>  spectrum refresh rate, 1..60 (default: 30)\n");
     fprintf(stderr, "  --demod <fm|am>     voice demodulator (default: fm)\n");
     fprintf(stderr, "  --lat/--lon <deg>   receiver reference for ADS-B local/surface CPR\n");
     fprintf(stderr, "  --output <format>   dashboard(default)|log|json|csv|avr|beast|quiet\n");
@@ -441,7 +492,8 @@ static int resolve_device_index(const char *selector) {
     uint32_t count = rtlsdr_get_device_count();
     if (!selector) return count > 0u ? 0 : -1;
     if (parse_int_arg(selector, &parsed)) {
-        return parsed >= 0 && (uint32_t)parsed < count ? parsed : -1;
+        if (parsed >= 0 && (uint32_t)parsed < count) return parsed;
+        /* Numeric USB serials such as 00000001 must not be mistaken for an index. */
     }
     parsed = rtlsdr_get_index_by_serial(selector);
     return parsed >= 0 && (uint32_t)parsed < count ? parsed : -1;
@@ -622,6 +674,19 @@ int main(int argc, char **argv) {
     int ppm = 0;
     int have_ppm = 0;
     uint32_t tuner_bw = 0;
+    int sample_rate_override = 0;
+    int spectrum_enabled = 0;
+    int spectrum_fd = STDOUT_FILENO;
+    int spectrum_fd_explicit = 0;
+    unsigned int spectrum_fft_size = 1024u;
+    double spectrum_fps = 30.0;
+    int filter_width_hz = 0;
+    int filter_width_explicit = 0;
+    analog_filter_type_t filter_type = ANALOG_FILTER_NONE;
+    int filter_type_explicit = 0;
+    float squelch_dbfs = 0.0f;
+    int squelch_enabled = 0;
+    int squelch_explicit = 0;
     const char *voice_demod = NULL;
     const char *adsb_frame = NULL;
     const char *sonde_frame = NULL;
@@ -679,6 +744,41 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "Invalid or missing value for --stats\n");
                 return 1;
             }
+            continue;
+        }
+        if (strcmp(arg, "--spectrum") == 0) {
+            spectrum_enabled = 1;
+            continue;
+        }
+        if (strcmp(arg, "--spectrum-fd") == 0) {
+            if (i + 1 >= argc || !parse_int_arg(argv[++i], &spectrum_fd)
+                || spectrum_fd < 0) {
+                fprintf(stderr, "Invalid or missing value for --spectrum-fd\n");
+                return 1;
+            }
+            spectrum_fd_explicit = 1;
+            spectrum_enabled = 1;
+            continue;
+        }
+        if (strcmp(arg, "--fft-size") == 0) {
+            int parsed_fft_size = 0;
+            if (i + 1 >= argc || !parse_int_arg(argv[++i], &parsed_fft_size)
+                || parsed_fft_size < 256 || parsed_fft_size > 4096
+                || (parsed_fft_size & (parsed_fft_size - 1)) != 0) {
+                fprintf(stderr, "Invalid --fft-size: use 256, 512, 1024, 2048 or 4096\n");
+                return 1;
+            }
+            spectrum_fft_size = (unsigned int)parsed_fft_size;
+            spectrum_enabled = 1;
+            continue;
+        }
+        if (strcmp(arg, "--spectrum-fps") == 0) {
+            if (i + 1 >= argc || !parse_double_arg(argv[++i], &spectrum_fps)
+                || spectrum_fps < 1.0 || spectrum_fps > 60.0) {
+                fprintf(stderr, "Invalid --spectrum-fps: use a value from 1 to 60\n");
+                return 1;
+            }
+            spectrum_enabled = 1;
             continue;
         }
         if (strcmp(arg, "--output") == 0) {
@@ -873,6 +973,53 @@ int main(int argc, char **argv) {
             tuner_bw = (uint32_t)parsed_bw;
             continue;
         }
+        if (strcmp(arg, "--sample-rate") == 0) {
+            if (i + 1 >= argc || !parse_int_arg(argv[++i], &sample_rate_override)
+                || sample_rate_override < 225001 || sample_rate_override > 3200000) {
+                fprintf(stderr, "Invalid --sample-rate: RTL-SDR range is 225001..3200000 Hz\n");
+                return 1;
+            }
+            continue;
+        }
+        if (strcmp(arg, "--filter-width") == 0
+            || strcmp(arg, "--filter-width-hz") == 0) {
+            if (i + 1 >= argc || !parse_int_arg(argv[++i], &filter_width_hz)
+                || filter_width_hz < 0) {
+                fprintf(stderr, "Invalid or missing value for --filter-width\n");
+                return 1;
+            }
+            filter_width_explicit = 1;
+            continue;
+        }
+        if (strcmp(arg, "--filter-type") == 0) {
+            if (i + 1 >= argc
+                || !parse_analog_filter_type(argv[++i], &filter_type)) {
+                fprintf(stderr, "Invalid --filter-type: use fir|iir|none\n");
+                return 1;
+            }
+            filter_type_explicit = 1;
+            continue;
+        }
+        if (strcmp(arg, "--squelch") == 0) {
+            double parsed_squelch;
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Missing value for --squelch\n");
+                return 1;
+            }
+            i++;
+            if (streq_icase(argv[i], "off") || streq_icase(argv[i], "none")) {
+                squelch_enabled = 0;
+            } else if (!parse_double_arg(argv[i], &parsed_squelch)
+                       || parsed_squelch < -120.0 || parsed_squelch > 0.0) {
+                fprintf(stderr, "Invalid --squelch: use -120..0 dBFS or off\n");
+                return 1;
+            } else {
+                squelch_dbfs = (float)parsed_squelch;
+                squelch_enabled = 1;
+            }
+            squelch_explicit = 1;
+            continue;
+        }
         if (strcmp(arg, "--demod") == 0) {
             if (i + 1 >= argc) {
                 fprintf(stderr, "Missing value for %s\n", arg);
@@ -952,6 +1099,30 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    if (sample_rate_override > 0 && !streq_icase(module->name, "voice")) {
+        fprintf(stderr, "--sample-rate currently applies only to mode=voice\n");
+        return 1;
+    }
+
+    if (!streq_icase(module->name, "voice")
+        && (filter_width_explicit || filter_type_explicit || squelch_explicit)) {
+        fprintf(stderr, "--filter-width, --filter-type and --squelch work only with mode=voice\n");
+        return 1;
+    }
+    if (streq_icase(module->name, "voice")) {
+        if (filter_width_hz > 0 && !filter_type_explicit) {
+            filter_type = ANALOG_FILTER_FIR;
+        }
+        if (filter_type != ANALOG_FILTER_NONE && filter_width_hz == 0) {
+            fprintf(stderr, "--filter-type requires a positive --filter-width\n");
+            return 1;
+        }
+        if (filter_type == ANALOG_FILTER_NONE && filter_width_hz > 0) {
+            fprintf(stderr, "--filter-width requires --filter-type fir or iir\n");
+            return 1;
+        }
+    }
+
     if (streq_icase(module->name, "sstv")) {
         if (!sstv_module_set_mode(&g_sstv, sstv_mode)) {
             fprintf(stderr, "Invalid --sstv-mode: use auto|pd120|martin-m1\n");
@@ -1002,6 +1173,23 @@ int main(int argc, char **argv) {
         (void)output_set_format_name("log");
     } else if (output_is_dashboard()) {
         dashboard_set_mode(module->name);
+    }
+
+    if (spectrum_enabled && streq_icase(module->name, "meteor")) {
+        fprintf(stderr, "Live spectrum is not available while SatDump owns the receiver\n");
+        return 1;
+    }
+    if (spectrum_enabled
+        && (input_path || ais_test || adsb_test || generic_test || ais_payload
+            || ais_nmea || adsb_frame || sonde_frame)) {
+        fprintf(stderr, "--spectrum is available only for a live RTL-SDR session\n");
+        return 1;
+    }
+    if (spectrum_enabled && !spectrum_fd_explicit
+        && output_get_format() != OUTPUT_FORMAT_QUIET) {
+        fprintf(stderr,
+                "--spectrum shares stdout only with --output quiet; use --spectrum-fd for GUI integration\n");
+        return 1;
     }
 
     if (ais_test && !streq_icase(module->name, "ais")) {
@@ -1118,6 +1306,26 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Invalid demodulator config for mode=%s\n", module->name);
         return 1;
     }
+    if (sample_rate_override > 0) {
+        if ((sample_rate_override % demod_cfg.output_fs) != 0) {
+            fprintf(stderr,
+                    "--sample-rate must be an integer multiple of the audio rate (%d Hz)\n",
+                    demod_cfg.output_fs);
+            return 1;
+        }
+        demod_cfg.input_fs = sample_rate_override;
+    }
+    if (streq_icase(module->name, "voice")) {
+        if (filter_width_hz >= demod_cfg.input_fs) {
+            fprintf(stderr, "--filter-width must be below the input sample rate (%d Hz)\n",
+                    demod_cfg.input_fs);
+            return 1;
+        }
+        demod_cfg.analog.filter_type = filter_type;
+        demod_cfg.analog.filter_width_hz = filter_width_hz;
+        demod_cfg.analog.squelch_enabled = squelch_enabled;
+        demod_cfg.analog.squelch_dbfs = squelch_dbfs;
+    }
 
     if (!module->init(module->ctx, &demod_cfg)) {
         fprintf(stderr, "Failed to initialize mode=%s\n", module->name);
@@ -1181,6 +1389,33 @@ int main(int argc, char **argv) {
     }
     uint32_t freq_hz = (uint32_t)llround(freq_mhz * 1e6);
 
+    FILE *spectrum_output = NULL;
+    int close_spectrum_output = 0;
+    if (spectrum_enabled) {
+        if (spectrum_fd == STDOUT_FILENO) {
+            spectrum_output = stdout;
+        } else {
+            spectrum_output = fdopen(spectrum_fd, "w");
+            close_spectrum_output = spectrum_output != NULL;
+        }
+        if (!spectrum_output) {
+            perror("Cannot open --spectrum-fd");
+            demodulator_flush(&g_demod);
+            module->flush(module->ctx);
+            return 1;
+        }
+        g_spectrum = spectrum_analyzer_create(
+            demod_cfg.input_fs, freq_hz, spectrum_fft_size, spectrum_fps,
+            spectrum_output);
+        if (!g_spectrum) {
+            fprintf(stderr, "Cannot initialize spectrum analyzer\n");
+            if (close_spectrum_output) fclose(spectrum_output);
+            demodulator_flush(&g_demod);
+            module->flush(module->ctx);
+            return 1;
+        }
+    }
+
     char gain_desc[32];
     if (use_manual_gain) snprintf(gain_desc, sizeof(gain_desc), "%d dB", gain);
     else snprintf(gain_desc, sizeof(gain_desc), "auto");
@@ -1205,6 +1440,11 @@ int main(int argc, char **argv) {
                 output_format_name(output_get_format()));
         if (have_ppm) fprintf(diag, " | ppm=%d", ppm);
         if (tuner_bw) fprintf(diag, " | bw=%u", tuner_bw);
+        if (filter_width_hz > 0) {
+            fprintf(diag, " | filter=%s/%dHz",
+                    analog_filter_type_name(filter_type), filter_width_hz);
+        }
+        if (squelch_enabled) fprintf(diag, " | squelch=%.1f dBFS", squelch_dbfs);
         fprintf(diag, "\n  Ctrl+C to stop\n");
     }
 
@@ -1241,6 +1481,10 @@ int main(int argc, char **argv) {
             }
         }
     }
+
+    spectrum_analyzer_destroy(g_spectrum);
+    g_spectrum = NULL;
+    if (close_spectrum_output) fclose(spectrum_output);
 
     demodulator_flush(&g_demod);
     module->flush(module->ctx);

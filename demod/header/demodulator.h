@@ -28,6 +28,7 @@ typedef struct {
     demod_kind_t kind;
     int input_fs;
     int output_fs;
+    analog_frontend_config_t analog;
     union {
         struct {
             unsigned int symbol_rate;
@@ -56,6 +57,10 @@ typedef struct {
 
 int demodulator_init(demodulator_t *ctx, const demod_config_t *config, const demod_output_t *output);
 void demodulator_process_raw_iq_u8(demodulator_t *ctx, const unsigned char *buf, uint32_t len);
+int demodulator_get_squelch_status(const demodulator_t *ctx,
+                                   float *level_dbfs,
+                                   float *threshold_dbfs,
+                                   int *open);
 void demodulator_flush(demodulator_t *ctx);
 
 #ifdef __cplusplus

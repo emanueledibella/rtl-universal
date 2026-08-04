@@ -2,3 +2,5 @@
 rtl-universal
 rtl-universal
 *.o
+tests/analog_frontend_test
+tests/spectrum_test

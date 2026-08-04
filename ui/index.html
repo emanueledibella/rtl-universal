@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="it">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#090b12" />
+    <title>RTL Universal Studio</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="ambient ambient-one"></div>
+    <div class="ambient ambient-two"></div>
+    <div class="app-shell">
+      <header class="app-header">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true">
+            <span></span><span></span><span></span><span></span><span></span>
+          </div>
+          <div>
+            <strong>RTL Universal</strong>
+            <small>Spectrum studio</small>
+          </div>
+        </div>
+
+        <div class="mode-switch" role="tablist" aria-label="Modalità ricevitore">
+          <button class="mode-button active" data-mode="live" role="tab" aria-selected="true">
+            <span class="mode-dot live-dot"></span> Live
+          </button>
+          <button class="mode-button" data-mode="scan" role="tab" aria-selected="false">
+            <span class="mode-dot scan-dot"></span> Scan
+          </button>
+        </div>
+
+        <div class="header-status">
+          <div class="status-copy">
+            <span id="status-label">Pronto</span>
+            <small id="status-detail">Ricevitore fermo</small>
+          </div>
+          <span id="connection-light" class="connection-light"></span>
+        </div>
+      </header>
+
+      <section class="tune-bar glass-panel">
+        <div class="live-tune tune-group">
+          <label class="compact-field protocol-field">
+            <span>Protocollo</span>
+            <select id="protocol-select">
+              <option value="voice">Voice</option>
+              <option value="adsb">ADS-B / Mode S</option>
+              <option value="ais">AIS marittimo</option>
+              <option value="sonde">Radiosonda RS41</option>
+              <option value="sstv">SSTV</option>
+            </select>
+          </label>
+          <label class="frequency-field">
+            <span>Frequenza centrale</span>
+            <div class="frequency-input-wrap">
+              <input id="frequency-input" type="number" min="10" max="1766" step="0.001" value="145.500" />
+              <b>MHz</b>
+            </div>
+          </label>
+          <div class="span-readout">
+            <span>Span istantaneo</span>
+            <strong id="span-label">2.400 MHz</strong>
+          </div>
+        </div>
+
+        <div class="scan-tune tune-group hidden">
+          <label class="compact-field">
+            <span>Da</span>
+            <div class="inline-unit"><input id="scan-start" type="number" min="24" max="1765" value="50" /><b>MHz</b></div>
+          </label>
+          <span class="range-arrow">→</span>
+          <label class="compact-field">
+            <span>A</span>
+            <div class="inline-unit"><input id="scan-end" type="number" min="25" max="1766" value="1700" /><b>MHz</b></div>
+          </label>
+          <label class="compact-field resolution-field">
+            <span>Risoluzione</span>
+            <select id="scan-resolution">
+              <option value="25000">25 kHz</option>
+              <option value="50000">50 kHz</option>
+              <option value="100000" selected>100 kHz</option>
+              <option value="250000">250 kHz</option>
+              <option value="500000">500 kHz</option>
+              <option value="1000000">1 MHz</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="tune-actions">
+          <button id="stop-button" class="button button-ghost" disabled>
+            <span class="stop-icon"></span> Stop
+          </button>
+          <button id="start-button" class="button button-primary">
+            <span class="play-icon"></span><span id="start-button-label">Avvia Live</span>
+          </button>
+        </div>
+      </section>
+
+      <main class="workspace">
+        <section class="visual-column">
+          <article class="visual-card glass-panel">
+            <div class="card-heading">
+              <div>
+                <span class="eyebrow" id="visual-eyebrow">Analizzatore live</span>
+                <h1 id="visual-title">145.500 <small>MHz</small></h1>
+              </div>
+              <div class="visual-metrics">
+                <div><span>Picco</span><strong id="peak-value">— dBFS</strong></div>
+                <div><span>Refresh</span><strong id="fps-value">— FPS</strong></div>
+                <div><span>FFT</span><strong id="fft-value">1024</strong></div>
+              </div>
+            </div>
+
+            <div id="live-visual" class="canvas-stack">
+              <div class="canvas-label"><span>Spettro</span><span>Doppio clic per sintonizzare</span></div>
+              <canvas id="spectrum-canvas" aria-label="Spettro radio live"></canvas>
+              <div class="canvas-divider">
+                <span>Waterfall</span>
+                <div class="gradient-legend"><small>−120</small><i></i><small>0 dBFS</small></div>
+              </div>
+              <canvas id="waterfall-canvas" aria-label="Waterfall radio live"></canvas>
+              <div id="tuning-marker" class="tuning-marker"><span></span></div>
+            </div>
+
+            <div id="scan-visual" class="scan-canvas-wrap hidden">
+              <div class="scan-progress-row">
+                <div>
+                  <span id="scan-progress-label">Mappa pronta per la scansione</span>
+                  <small id="scan-progress-detail">Usa la rotella per lo zoom e trascina per spostarti</small>
+                </div>
+                <strong id="scan-progress-value">0%</strong>
+              </div>
+              <div class="progress-track"><span id="scan-progress-bar"></span></div>
+              <canvas id="scan-canvas" aria-label="Mappa dello spettro scansionato"></canvas>
+              <div class="scan-hint">Doppio clic su un segnale per aprirlo immediatamente in modalità Live</div>
+            </div>
+          </article>
+
+          <article class="decoder-card glass-panel">
+            <div class="decoder-heading">
+              <div>
+                <span class="eyebrow">Decoder</span>
+                <h2 id="decoder-title">Audio e attività</h2>
+              </div>
+              <div class="decoder-tabs">
+                <button class="decoder-tab active" data-decoder-tab="data">Dati live</button>
+                <button class="decoder-tab" data-decoder-tab="log">Diagnostica <span id="log-count">0</span></button>
+              </div>
+            </div>
+            <div id="decoder-content" class="decoder-content"></div>
+            <div id="log-content" class="log-content hidden"></div>
+          </article>
+        </section>
+
+        <aside class="inspector glass-panel">
+          <div class="inspector-heading">
+            <div>
+              <span class="eyebrow">Ricevitore</span>
+              <h2>Controlli</h2>
+            </div>
+            <button id="refresh-devices" class="icon-button" title="Aggiorna dispositivi" aria-label="Aggiorna dispositivi">↻</button>
+          </div>
+
+          <div class="control-section">
+            <label class="field">
+              <span>Dispositivo RTL-SDR</span>
+              <select id="device-select"><option value="0">Dispositivo 0</option></select>
+            </label>
+            <label class="toggle-row">
+              <span><b>Controllo automatico gain</b><small>Lascia al tuner la regolazione RF</small></span>
+              <input id="gain-auto" type="checkbox" checked />
+              <i></i>
+            </label>
+            <label class="field range-field" id="gain-field">
+              <span><b>Gain manuale</b><output id="gain-output">20 dB</output></span>
+              <input id="gain-input" type="range" min="0" max="50" step="1" value="20" disabled />
+            </label>
+            <label class="field">
+              <span>Correzione frequenza</span>
+              <div class="inline-unit"><input id="ppm-input" type="number" min="-200" max="200" value="0" /><b>PPM</b></div>
+            </label>
+            <label class="field live-only-control">
+              <span>Banda analogica tuner</span>
+              <select id="tuner-bandwidth">
+                <option value="0">Automatica</option>
+                <option value="200000">200 kHz</option>
+                <option value="1000000">1 MHz</option>
+                <option value="2400000">2.4 MHz</option>
+              </select>
+            </label>
+          </div>
+
+          <div id="protocol-section-rule" class="section-rule"></div>
+          <div id="protocol-controls" class="control-section"></div>
+
+          <div class="section-rule live-only-control"></div>
+          <div class="control-section live-only-control">
+            <div class="section-title"><span>Visualizzazione</span><small>FFT locale</small></div>
+            <label class="field">
+              <span>Risoluzione FFT</span>
+              <select id="fft-size-select">
+                <option value="512">512 bin</option>
+                <option value="1024" selected>1024 bin</option>
+                <option value="2048">2048 bin</option>
+                <option value="4096">4096 bin</option>
+              </select>
+            </label>
+            <label class="field range-field">
+              <span><b>Refresh</b><output id="fps-output">30 FPS</output></span>
+              <input id="fps-input" type="range" min="5" max="60" step="5" value="30" />
+            </label>
+          </div>
+        </aside>
+      </main>
+    </div>
+
+    <div id="toast" class="toast" role="status"></div>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

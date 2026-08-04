@@ -17,6 +17,52 @@ make test
 Il binario generato è `rtl-universal`. `make strict` abilita anche tutti i
 warning usati come errori.
 
+## RTL Universal Studio: Live e Scan
+
+Il progetto include una UI locale moderna per spettro, waterfall, sintonia e
+pannelli dedicati ai protocolli. Non richiede pacchetti npm: usa Node.js per il
+controller locale e il binario C per acquisizione, DSP e decoder.
+
+```sh
+make strict
+npm start
+```
+
+Aprire quindi `http://127.0.0.1:4173` nel browser. In alternativa:
+
+```sh
+make ui
+```
+
+La modalità **Live** acquisisce FFT in parallelo alla decodifica, fino a 60 FPS.
+Per Voice si può scegliere uno span istantaneo fino a 2,4 MHz, mantenendo il
+filtro audio stretto sul canale centrale. Un doppio clic su spettro o waterfall
+ricentra immediatamente la sessione.
+
+La modalità **Scan** usa `rtl_power` per attraversare un intervallo ampio, per
+esempio 50–1700 MHz, e ricompone progressivamente i blocchi in una mappa unica.
+La mappa supporta zoom con la rotella, pan tramite trascinamento e doppio clic
+per passare a Live sulla frequenza selezionata. Scan e Live sono mutuamente
+esclusivi con un singolo dongle, perché entrambi devono controllare il tuner.
+
+I controlli disponibili nella UI includono dispositivo, gain/AGC, PPM, banda
+del tuner, frequenza, FFT e refresh. Il pannello contestuale aggiunge AM/FM,
+sample rate, filtro e squelch per Voice; coordinate per ADS-B; canale AIS;
+formato e cartella di salvataggio per SSTV. Le tabelle ADS-B, AIS e RS41 sono
+alimentate dagli eventi JSON già prodotti dal decoder.
+
+### FFT live dalla CLI
+
+`--spectrum` abilita il tap FFT. Se lo spettro va su stdout occorre usare
+`--output quiet`; una GUI può invece fornire un file descriptor separato con
+`--spectrum-fd`, evitando qualsiasi interferenza con gli eventi del decoder.
+
+```sh
+./rtl-universal 145.500 --mode voice --demod fm \
+  --sample-rate 2400000 --filter-width 15000 --filter-type iir \
+  --output quiet --spectrum --fft-size 1024 --spectrum-fps 30
+```
+
 ## Avvio rapido con RTL-SDR
 
 ```sh
@@ -26,6 +72,10 @@ warning usati come errori.
 # Voce: la frequenza è obbligatoria
 ./rtl-universal 145.500 --mode voice --demod fm
 ./rtl-universal 118.300 --mode voice --demod am
+
+# Filtro RF di canale da 12,5 kHz e squelch a -45 dBFS
+./rtl-universal 145.500 --mode voice --demod fm \
+  --filter-width 12500 --filter-type fir --squelch -45
 
 # Entrambi i canali AIS con un solo dongle, centro a 162.000 MHz
 ./rtl-universal --mode ais
@@ -61,6 +111,19 @@ segnale. Per tornare al flusso dettagliato riga per riga si usa
 ```
 
 La modalità voce continua invece a usare automaticamente l'output testuale.
+
+In modalità `voice`, `--filter-width <hz>` imposta la larghezza RF complessiva
+del filtro di canale applicato ai campioni I/Q prima della demodulazione. Il
+tipo si sceglie con `--filter-type fir|iir|none`: se si specifica soltanto la
+larghezza viene usato `fir`; `0`/`none` disabilitano il filtro. Il FIR Kaiser
+offre una selettività più netta, mentre l'IIR Butterworth richiede meno CPU.
+`--squelch <dbfs>` silenzia l'audio sotto la soglia indicata (`-120..0`). La
+potenza viene mediata per circa 10 ms e confrontata direttamente con la
+soglia, usando la stessa convenzione dBFS dello squelch semplice di Gqrx;
+`--squelch off` lo disabilita. Con `--stats 1` il log mostra `channel`, cioè
+il livello post-filtro effettivamente confrontato, e lo stato
+`squelch=open|closed`. Questi controlli DSP sono distinti da `--bw`, che
+configura invece la banda analogica del tuner RTL-SDR.
 
 ### Comandi consigliati
 
