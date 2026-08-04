@@ -4,8 +4,12 @@
 // demodulator. All protocol-specific DSP lives outside this file.
 
 #include <ctype.h>
+#include <errno.h>
 #include <math.h>
+#include <poll.h>
+#include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,9 +32,20 @@
 #include "utility/spectrum.h"
 
 static volatile int g_stop = 0;
-static rtlsdr_dev_t *g_dev = NULL;
+static _Atomic(rtlsdr_dev_t *) g_dev = NULL;
+static pthread_mutex_t g_dev_lock = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic uint32_t g_current_frequency_hz = 0u;
 static demodulator_t g_demod;
 static spectrum_analyzer_t *g_spectrum = NULL;
+
+typedef struct {
+    int fd;
+    pthread_t thread;
+    _Atomic int stop;
+    int running;
+} runtime_control_t;
+
+static runtime_control_t g_control;
 
 static voice_module_t g_voice;
 static ais_receiver_t g_ais;
@@ -173,9 +188,11 @@ typedef struct {
 } module_ops_t;
 
 static void on_sigint(int sig) {
+    rtlsdr_dev_t *dev;
     (void)sig;
     g_stop = 1;
-    if (g_dev) rtlsdr_cancel_async(g_dev);
+    dev = atomic_load_explicit(&g_dev, memory_order_relaxed);
+    if (dev) rtlsdr_cancel_async(dev);
     meteor_module_stop();
 }
 
@@ -404,6 +421,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "  --stats <sec>       receiver status interval; 0 disables (default: 5)\n");
     fprintf(stderr, "  --spectrum          emit live FFT frames for a GUI\n");
     fprintf(stderr, "  --spectrum-fd <n>   file descriptor for spectrum JSON (default: stdout)\n");
+    fprintf(stderr, "  --control-fd <n>    read live TUNE/SQUELCH commands from this descriptor\n");
     fprintf(stderr, "  --fft-size <n>      FFT bins: 256|512|1024|2048|4096 (default: 1024)\n");
     fprintf(stderr, "  --spectrum-fps <n>  spectrum refresh rate, 1..60 (default: 30)\n");
     fprintf(stderr, "  --demod <fm|am>     voice demodulator (default: fm)\n");
@@ -449,6 +467,121 @@ static int parse_double_arg(const char *s, double *out) {
     if (s == end || *end != '\0' || !isfinite(value)) return 0;
     *out = value;
     return 1;
+}
+
+static void runtime_control_handle_line(const char *line) {
+    unsigned long requested_frequency = 0ul;
+    int squelch_enabled = 0;
+    double squelch_threshold = 0.0;
+
+    if (!line) return;
+    if (sscanf(line, "TUNE %lu", &requested_frequency) == 1) {
+        rtlsdr_dev_t *dev;
+        int result;
+        if (requested_frequency < 10000000ul
+            || requested_frequency > 4294000000ul) {
+            fprintf(stderr, "[CONTROL] event=tune-failed reason=invalid-frequency\n");
+            return;
+        }
+        (void)pthread_mutex_lock(&g_dev_lock);
+        dev = atomic_load_explicit(&g_dev, memory_order_acquire);
+        if (!dev) {
+            (void)pthread_mutex_unlock(&g_dev_lock);
+            fprintf(stderr, "[CONTROL] event=tune-failed reason=receiver-not-ready\n");
+            return;
+        }
+        result = rtlsdr_set_center_freq(dev, (uint32_t)requested_frequency);
+        (void)pthread_mutex_unlock(&g_dev_lock);
+        if (result < 0) {
+            fprintf(stderr, "[CONTROL] event=tune-failed error=%d\n", result);
+            return;
+        }
+        atomic_store_explicit(&g_current_frequency_hz,
+                              (uint32_t)requested_frequency,
+                              memory_order_release);
+        spectrum_analyzer_set_center_frequency(
+            g_spectrum, (uint32_t)requested_frequency);
+        fprintf(stderr, "[CONTROL] event=tuned frequency_hz=%lu\n",
+                requested_frequency);
+        return;
+    }
+    if (sscanf(line, "SQUELCH %d %lf", &squelch_enabled,
+               &squelch_threshold) == 2) {
+        if ((squelch_enabled != 0 && squelch_enabled != 1)
+            || !demodulator_set_squelch(&g_demod, squelch_enabled,
+                                        (float)squelch_threshold)) {
+            fprintf(stderr, "[CONTROL] event=squelch-failed\n");
+            return;
+        }
+        fprintf(stderr,
+                "[CONTROL] event=squelch enabled=%d threshold_dbfs=%.1f\n",
+                squelch_enabled, squelch_threshold);
+        return;
+    }
+    fprintf(stderr, "[CONTROL] event=invalid-command\n");
+}
+
+static void *runtime_control_worker(void *user) {
+    runtime_control_t *control = (runtime_control_t *)user;
+    char input[512];
+    char line[256];
+    size_t line_length = 0u;
+
+    if (!control) return NULL;
+    while (!atomic_load_explicit(&control->stop, memory_order_relaxed)) {
+        struct pollfd descriptor;
+        int poll_result;
+        descriptor.fd = control->fd;
+        descriptor.events = POLLIN;
+        descriptor.revents = 0;
+        poll_result = poll(&descriptor, 1u, 200);
+        if (poll_result < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (poll_result == 0) continue;
+        if ((descriptor.revents & POLLIN) != 0) {
+            ssize_t count = read(control->fd, input, sizeof(input));
+            if (count <= 0) break;
+            for (ssize_t i = 0; i < count; i++) {
+                char value = input[i];
+                if (value == '\n' || value == '\r') {
+                    if (line_length > 0u) {
+                        line[line_length] = '\0';
+                        runtime_control_handle_line(line);
+                        line_length = 0u;
+                    }
+                } else if (line_length + 1u < sizeof(line)) {
+                    line[line_length++] = value;
+                } else {
+                    line_length = 0u;
+                }
+            }
+        }
+        if ((descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) break;
+    }
+    return NULL;
+}
+
+static int runtime_control_start(int fd) {
+    if (fd < 0) return 1;
+    memset(&g_control, 0, sizeof(g_control));
+    g_control.fd = fd;
+    atomic_init(&g_control.stop, 0);
+    if (pthread_create(&g_control.thread, NULL, runtime_control_worker,
+                       &g_control) != 0) {
+        return 0;
+    }
+    g_control.running = 1;
+    return 1;
+}
+
+static void runtime_control_stop(void) {
+    if (!g_control.running) return;
+    atomic_store_explicit(&g_control.stop, 1, memory_order_relaxed);
+    (void)pthread_join(g_control.thread, NULL);
+    (void)close(g_control.fd);
+    g_control.running = 0;
 }
 
 static int parse_input_format(const char *name, input_format_t *format) {
@@ -678,6 +811,7 @@ int main(int argc, char **argv) {
     int spectrum_enabled = 0;
     int spectrum_fd = STDOUT_FILENO;
     int spectrum_fd_explicit = 0;
+    int control_fd = -1;
     unsigned int spectrum_fft_size = 1024u;
     double spectrum_fps = 30.0;
     int filter_width_hz = 0;
@@ -758,6 +892,14 @@ int main(int argc, char **argv) {
             }
             spectrum_fd_explicit = 1;
             spectrum_enabled = 1;
+            continue;
+        }
+        if (strcmp(arg, "--control-fd") == 0) {
+            if (i + 1 >= argc || !parse_int_arg(argv[++i], &control_fd)
+                || control_fd < 0) {
+                fprintf(stderr, "Invalid or missing value for --control-fd\n");
+                return 1;
+            }
             continue;
         }
         if (strcmp(arg, "--fft-size") == 0) {
@@ -1191,6 +1333,17 @@ int main(int argc, char **argv) {
                 "--spectrum shares stdout only with --output quiet; use --spectrum-fd for GUI integration\n");
         return 1;
     }
+    if (control_fd >= 0
+        && (input_path || ais_test || adsb_test || generic_test || ais_payload
+            || ais_nmea || adsb_frame || sonde_frame
+            || streq_icase(module->name, "meteor"))) {
+        fprintf(stderr, "--control-fd is available only for a live RTL-SDR session\n");
+        return 1;
+    }
+    if (control_fd >= 0 && spectrum_enabled && control_fd == spectrum_fd) {
+        fprintf(stderr, "--control-fd and --spectrum-fd must be different descriptors\n");
+        return 1;
+    }
 
     if (ais_test && !streq_icase(module->name, "ais")) {
         fprintf(stderr, "--ais-test works only with mode=ais\n");
@@ -1388,6 +1541,8 @@ int main(int argc, char **argv) {
         return 1;
     }
     uint32_t freq_hz = (uint32_t)llround(freq_mhz * 1e6);
+    atomic_store_explicit(&g_current_frequency_hz, freq_hz,
+                          memory_order_relaxed);
 
     FILE *spectrum_output = NULL;
     int close_spectrum_output = 0;
@@ -1414,6 +1569,16 @@ int main(int argc, char **argv) {
             module->flush(module->ctx);
             return 1;
         }
+    }
+
+    if (!runtime_control_start(control_fd)) {
+        fprintf(stderr, "Cannot initialize runtime control channel\n");
+        spectrum_analyzer_destroy(g_spectrum);
+        g_spectrum = NULL;
+        if (close_spectrum_output) fclose(spectrum_output);
+        demodulator_flush(&g_demod);
+        module->flush(module->ctx);
+        return 1;
     }
 
     char gain_desc[32];
@@ -1451,18 +1616,25 @@ int main(int argc, char **argv) {
     int final_read_result = 0;
     while (!g_stop) {
         rtlsdr_dev_t *dev = NULL;
+        uint32_t requested_frequency = atomic_load_explicit(
+            &g_current_frequency_hz, memory_order_acquire);
         int r;
-        if (!open_configured_rtlsdr(&dev, device_selector, &demod_cfg, freq_hz,
+        if (!open_configured_rtlsdr(&dev, device_selector, &demod_cfg,
+                                    requested_frequency,
                                     have_ppm, ppm, tuner_bw, use_manual_gain, gain)) {
             final_read_result = -1;
             if (output_is_dashboard()) dashboard_set_connection("device non trovato");
         } else {
             if (output_is_dashboard()) dashboard_set_connection("connesso");
-            g_dev = dev;
+            (void)pthread_mutex_lock(&g_dev_lock);
+            atomic_store_explicit(&g_dev, dev, memory_order_release);
+            (void)pthread_mutex_unlock(&g_dev_lock);
             r = rtlsdr_read_async(dev, rtlsdr_cb, &g_live_stats, 0, 0);
             final_read_result = r;
-            g_dev = NULL;
+            (void)pthread_mutex_lock(&g_dev_lock);
+            atomic_store_explicit(&g_dev, NULL, memory_order_release);
             rtlsdr_close(dev);
+            (void)pthread_mutex_unlock(&g_dev_lock);
             live_stats_maybe_report(&g_live_stats, 1);
             if (!g_stop) {
                 if (output_is_dashboard()) dashboard_set_connection("disconnesso");
@@ -1482,6 +1654,7 @@ int main(int argc, char **argv) {
         }
     }
 
+    runtime_control_stop();
     spectrum_analyzer_destroy(g_spectrum);
     g_spectrum = NULL;
     if (close_spectrum_output) fclose(spectrum_output);

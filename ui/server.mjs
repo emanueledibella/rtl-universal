@@ -163,6 +163,7 @@ async function startLive(config) {
     '--stats', '1',
     '--spectrum',
     '--spectrum-fd', '3',
+    '--control-fd', '4',
     '--fft-size', String(fftSize),
     '--spectrum-fps', String(fps),
   ];
@@ -183,7 +184,7 @@ async function startLive(config) {
     args.push('--demod', demod, '--sample-rate', String(sampleRate));
     args.push('--filter-width', String(filterWidth), '--filter-type', optionalText(config.filterType, 'iir'));
     if (config.squelchEnabled) {
-      args.push('--squelch', String(finiteNumber(config.squelchDbfs ?? -55, 'squelch', -120, 0)));
+      args.push('--squelch', String(finiteNumber(config.squelchDbfs ?? -30, 'squelch', -120, 0)));
     } else {
       args.push('--squelch', 'off');
     }
@@ -210,9 +211,16 @@ async function startLive(config) {
   await stopActive('switch-to-live');
   const child = spawn(receiverBinary, args, {
     cwd: projectRoot,
-    stdio: ['ignore', 'pipe', 'pipe', 'pipe'],
+    stdio: ['ignore', 'pipe', 'pipe', 'pipe', 'pipe'],
   });
-  const session = { id: randomUUID(), kind: 'live', child, stopping: false, config: { ...config, protocol, frequencyMhz } };
+  const session = {
+    id: randomUUID(),
+    kind: 'live',
+    child,
+    control: child.stdio[4],
+    stopping: false,
+    config: { ...config, protocol, frequencyMhz },
+  };
   activeSession = session;
   trackChild(child, session);
 
@@ -228,7 +236,22 @@ async function startLive(config) {
   });
   attachLineReader(child.stderr, (line) => {
     const trimmed = line.trim();
-    if (trimmed) broadcast({ type: 'diagnostic', level: /error|failed|invalid/i.test(trimmed) ? 'error' : 'info', source: 'receiver', message: trimmed });
+    if (!trimmed) return;
+    const squelchStatus = trimmed.match(/channel=([-+\d.]+) dBFS squelch_threshold=([-+\d.]+) dBFS squelch=(open|closed)/);
+    if (squelchStatus) {
+      broadcast({
+        type: 'receiver_status',
+        sessionId: session.id,
+        channel_dbfs: Number(squelchStatus[1]),
+        squelch_threshold_dbfs: Number(squelchStatus[2]),
+        squelch_open: squelchStatus[3] === 'open',
+      });
+    }
+    const tuned = trimmed.match(/\[CONTROL] event=tuned frequency_hz=(\d+)/);
+    if (tuned) {
+      broadcast({ type: 'tuned', sessionId: session.id, frequency_hz: Number(tuned[1]) });
+    }
+    broadcast({ type: 'diagnostic', level: /error|failed|invalid/i.test(trimmed) ? 'error' : 'info', source: 'receiver', message: trimmed });
   });
   attachLineReader(child.stdio[3], (line) => {
     try {
@@ -245,6 +268,42 @@ async function startLive(config) {
 
   updateState({ mode: 'live', status: 'starting', sessionId: session.id, protocol, frequencyMhz });
   return { sessionId: session.id, args };
+}
+
+function writeLiveControl(command) {
+  const session = activeSession;
+  if (!session || session.kind !== 'live' || !session.control?.writable) {
+    throw new Error('No active Live session');
+  }
+  session.control.write(`${command}\n`);
+  return session;
+}
+
+function tuneLive(config) {
+  const frequencyMhz = finiteNumber(config.frequencyMhz, 'frequency', 10, 1766);
+  const session = writeLiveControl(`TUNE ${Math.round(frequencyMhz * 1e6)}`);
+  session.config.frequencyMhz = frequencyMhz;
+  updateState({
+    mode: 'live',
+    status: 'receiving',
+    sessionId: session.id,
+    protocol: session.config.protocol,
+    frequencyMhz,
+  });
+  return { sessionId: session.id, frequencyMhz };
+}
+
+function setLiveSquelch(config) {
+  const session = activeSession;
+  if (!session || session.kind !== 'live' || session.config.protocol !== 'voice') {
+    throw new Error('Squelch control requires an active Voice session');
+  }
+  const enabled = Boolean(config.enabled);
+  const thresholdDbfs = finiteNumber(config.thresholdDbfs ?? -30, 'squelch', -120, 0);
+  writeLiveControl(`SQUELCH ${enabled ? 1 : 0} ${thresholdDbfs}`);
+  session.config.squelchEnabled = enabled;
+  session.config.squelchDbfs = thresholdDbfs;
+  return { sessionId: session.id, enabled, thresholdDbfs };
 }
 
 function parseRtlPowerLine(line, config, session) {
@@ -389,6 +448,14 @@ const server = createServer(async (request, response) => {
     }
     if (request.method === 'POST' && url.pathname === '/api/live/start') {
       sendJson(response, 202, await startLive(await readJsonBody(request)));
+      return;
+    }
+    if (request.method === 'POST' && url.pathname === '/api/live/tune') {
+      sendJson(response, 202, tuneLive(await readJsonBody(request)));
+      return;
+    }
+    if (request.method === 'POST' && url.pathname === '/api/live/squelch') {
+      sendJson(response, 202, setLiveSquelch(await readJsonBody(request)));
       return;
     }
     if (request.method === 'POST' && url.pathname === '/api/scan/start') {

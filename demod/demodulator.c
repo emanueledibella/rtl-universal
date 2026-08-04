@@ -1,5 +1,6 @@
 #include "header/demodulator.h"
 
+#include <math.h>
 #include <string.h>
 
 int demodulator_init(demodulator_t *ctx, const demod_config_t *config, const demod_output_t *output) {
@@ -7,6 +8,9 @@ int demodulator_init(demodulator_t *ctx, const demod_config_t *config, const dem
 
     memset(ctx, 0, sizeof(*ctx));
     ctx->kind = config->kind;
+    atomic_init(&ctx->squelch_update_pending, 0);
+    atomic_init(&ctx->requested_squelch_enabled, 0);
+    atomic_init(&ctx->requested_squelch_dbfs, 0.0f);
 
     switch (config->kind) {
     case DEMOD_KIND_AM: {
@@ -50,6 +54,21 @@ int demodulator_init(demodulator_t *ctx, const demod_config_t *config, const dem
 void demodulator_process_raw_iq_u8(demodulator_t *ctx, const unsigned char *buf, uint32_t len) {
     if (!ctx || !buf) return;
 
+    if (atomic_exchange_explicit(&ctx->squelch_update_pending, 0,
+                                 memory_order_acquire)) {
+        int enabled = atomic_load_explicit(&ctx->requested_squelch_enabled,
+                                           memory_order_relaxed);
+        float threshold = atomic_load_explicit(&ctx->requested_squelch_dbfs,
+                                               memory_order_relaxed);
+        if (ctx->kind == DEMOD_KIND_AM) {
+            (void)analog_frontend_set_squelch(&ctx->u.am.frontend, enabled,
+                                              threshold);
+        } else if (ctx->kind == DEMOD_KIND_FM) {
+            (void)analog_frontend_set_squelch(&ctx->u.fm.frontend, enabled,
+                                              threshold);
+        }
+    }
+
     switch (ctx->kind) {
     case DEMOD_KIND_AM:
         am_demod_process_raw_iq_u8(&ctx->u.am, buf, len);
@@ -64,6 +83,24 @@ void demodulator_process_raw_iq_u8(demodulator_t *ctx, const unsigned char *buf,
     default:
         break;
     }
+}
+
+int demodulator_set_squelch(demodulator_t *ctx, int enabled,
+                            float threshold_dbfs) {
+    if (!ctx || (ctx->kind != DEMOD_KIND_AM && ctx->kind != DEMOD_KIND_FM)) {
+        return 0;
+    }
+    if (enabled && (!isfinite(threshold_dbfs)
+                    || threshold_dbfs < -120.0f || threshold_dbfs > 0.0f)) {
+        return 0;
+    }
+    atomic_store_explicit(&ctx->requested_squelch_enabled, enabled ? 1 : 0,
+                          memory_order_relaxed);
+    atomic_store_explicit(&ctx->requested_squelch_dbfs, threshold_dbfs,
+                          memory_order_relaxed);
+    atomic_store_explicit(&ctx->squelch_update_pending, 1,
+                          memory_order_release);
+    return 1;
 }
 
 int demodulator_get_squelch_status(const demodulator_t *ctx,

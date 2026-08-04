@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stdatomic.h>
 #include <stdint.h>
 
 #include "am_demod.h"
@@ -48,6 +49,9 @@ typedef struct {
 
 typedef struct {
     demod_kind_t kind;
+    _Atomic int squelch_update_pending;
+    _Atomic int requested_squelch_enabled;
+    _Atomic float requested_squelch_dbfs;
     union {
         am_demod_ctx_t am;
         fm_demod_ctx_t fm;
@@ -61,6 +65,8 @@ int demodulator_get_squelch_status(const demodulator_t *ctx,
                                    float *level_dbfs,
                                    float *threshold_dbfs,
                                    int *open);
+int demodulator_set_squelch(demodulator_t *ctx, int enabled,
+                            float threshold_dbfs);
 void demodulator_flush(demodulator_t *ctx);
 
 #ifdef __cplusplus

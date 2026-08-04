@@ -23,6 +23,8 @@ const elements = {
   fftValue: $('#fft-value'),
   spectrumCanvas: $('#spectrum-canvas'),
   waterfallCanvas: $('#waterfall-canvas'),
+  tuningMarker: $('#tuning-marker'),
+  tuningTooltip: $('#tuning-tooltip'),
   scanCanvas: $('#scan-canvas'),
   scanStart: $('#scan-start'),
   scanEnd: $('#scan-end'),
@@ -68,6 +70,8 @@ const state = {
   framesThisSecond: 0,
   measuredFps: 0,
   lastFpsAt: performance.now(),
+  receiverStatus: { channelDbfs: null, thresholdDbfs: null, squelchOpen: null },
+  liveTune: { dragging: false, rect: null, frequencyHz: null },
   logs: [],
   adsb: new Map(),
   ais: new Map(),
@@ -401,7 +405,7 @@ function protocolControlMarkup(protocol) {
       <label class="field"><span>Larghezza filtro</span><select id="voice-filter-width"><option value="8000">8 kHz</option><option value="12500">12.5 kHz</option><option value="15000" selected>15 kHz</option><option value="25000">25 kHz</option><option value="50000">50 kHz</option></select></label>
       <label class="field"><span>Tipo filtro</span><select id="voice-filter-type"><option value="iir" selected>IIR Butterworth</option><option value="fir">FIR Kaiser</option></select></label>
       <label class="toggle-row"><span><b>Squelch</b><small>Silenzia il rumore sotto soglia</small></span><input id="squelch-enabled" type="checkbox" /><i></i></label>
-      <label class="field range-field"><span><b>Soglia squelch</b><output id="squelch-output">−55 dBFS</output></span><input id="squelch-input" type="range" min="-120" max="0" step="1" value="-55" /></label>`;
+      <label class="field range-field"><span><b>Soglia squelch</b><output id="squelch-output">−30 dBFS</output></span><input id="squelch-input" type="range" min="-120" max="0" step="1" value="-30" /></label>`;
   }
   if (protocol === 'adsb') {
     return `
@@ -430,6 +434,8 @@ function updateProtocolControls() {
   sampleRate?.addEventListener('change', updateSpanLabel);
   const squelch = $('#squelch-input');
   squelch?.addEventListener('input', () => { $('#squelch-output').textContent = `${squelch.value.replace('-', '−')} dBFS`; });
+  squelch?.addEventListener('change', updateRuntimeSquelch);
+  $('#squelch-enabled')?.addEventListener('change', updateRuntimeSquelch);
   renderDecoder();
   updateSpanLabel();
 }
@@ -489,6 +495,30 @@ function collectScanConfig() {
     binHz: Number(elements.scanResolution.value),
     integrationSeconds: 1,
   };
+}
+
+async function updateRuntimeSquelch() {
+  const enabledControl = $('#squelch-enabled');
+  const thresholdControl = $('#squelch-input');
+  if (!enabledControl || !thresholdControl
+      || state.processMode !== 'live'
+      || !['starting', 'receiving'].includes(state.processStatus)) {
+    return;
+  }
+  try {
+    await api('/api/live/squelch', {
+      method: 'POST',
+      body: JSON.stringify({
+        enabled: enabledControl.checked,
+        thresholdDbfs: Number(thresholdControl.value),
+      }),
+    });
+    state.receiverStatus.thresholdDbfs = Number(thresholdControl.value);
+    if (!enabledControl.checked) state.receiverStatus.squelchOpen = null;
+    renderVoiceDecoder();
+  } catch (error) {
+    toast(error.message, 'error');
+  }
 }
 
 function setMode(mode) {
@@ -556,7 +586,7 @@ async function stopSession() {
   }
 }
 
-async function tuneLive(frequencyHz) {
+async function openLiveAtFrequency(frequencyHz) {
   const frequencyMhz = frequencyHz / 1e6;
   elements.frequency.value = frequencyMhz.toFixed(6).replace(/0+$/, '').replace(/\.$/, '');
   setMode('live');
@@ -570,10 +600,64 @@ async function tuneLive(frequencyHz) {
   }
 }
 
-function liveFrequencyFromPointer(event, canvas) {
-  const rect = canvas.getBoundingClientRect();
-  const ratio = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
-  return state.centerHz - state.sampleRate / 2 + ratio * state.sampleRate;
+async function retuneLive(frequencyHz) {
+  const frequencyMhz = frequencyHz / 1e6;
+  elements.frequency.value = frequencyMhz.toFixed(6).replace(/0+$/, '').replace(/\.$/, '');
+  elements.title.innerHTML = `${frequencyMhz.toFixed(3)} <small>MHz</small>`;
+  if (state.processMode !== 'live'
+      || !['starting', 'receiving'].includes(state.processStatus)) {
+    state.centerHz = frequencyHz;
+    return;
+  }
+  try {
+    await api('/api/live/tune', {
+      method: 'POST',
+      body: JSON.stringify({ frequencyMhz }),
+    });
+  } catch (error) {
+    elements.tuningMarker.style.left = '50%';
+    toast(error.message, 'error');
+  }
+}
+
+function previewLiveTune(clientX) {
+  const tune = state.liveTune;
+  if (!tune.rect) return;
+  const ratio = Math.max(0, Math.min(1,
+    (clientX - tune.rect.left) / tune.rect.width));
+  tune.frequencyHz = tune.centerHz - tune.sampleRate / 2
+                     + ratio * tune.sampleRate;
+  elements.tuningMarker.style.left = `${ratio * 100}%`;
+  elements.tuningTooltip.textContent = formatFrequency(tune.frequencyHz, 4);
+}
+
+function beginLiveTune(event) {
+  if (event.button !== 0) return;
+  event.preventDefault();
+  const sourceIsMarker = event.currentTarget === elements.tuningMarker;
+  state.liveTune.dragging = true;
+  state.liveTune.rect = (sourceIsMarker ? elements.liveVisual : event.currentTarget)
+    .getBoundingClientRect();
+  state.liveTune.centerHz = state.centerHz;
+  state.liveTune.sampleRate = state.sampleRate;
+  elements.tuningMarker.classList.add('dragging');
+  previewLiveTune(event.clientX);
+}
+
+function moveLiveTune(event) {
+  if (!state.liveTune.dragging) return;
+  previewLiveTune(event.clientX);
+}
+
+function finishLiveTune(event) {
+  if (!state.liveTune.dragging) return;
+  previewLiveTune(event.clientX);
+  const frequencyHz = state.liveTune.frequencyHz;
+  state.liveTune.dragging = false;
+  state.liveTune.rect = null;
+  elements.tuningMarker.classList.remove('dragging');
+  elements.tuningMarker.style.left = '50%';
+  if (Number.isFinite(frequencyHz)) void retuneLive(frequencyHz);
 }
 
 function updateScanProgress(progress) {
@@ -588,9 +672,20 @@ function updateScanProgress(progress) {
 
 function renderVoiceDecoder() {
   elements.decoderTitle.textContent = 'Audio e attività';
+  const squelchEnabled = $('#squelch-enabled')?.checked;
+  const squelchLabel = !squelchEnabled
+    ? 'Squelch disattivato'
+    : state.receiverStatus.squelchOpen === true
+      ? 'Squelch aperto'
+      : state.receiverStatus.squelchOpen === false
+        ? 'Squelch chiuso'
+        : 'Squelch in attesa';
+  const channelLevel = Number.isFinite(state.receiverStatus.channelDbfs)
+    ? ` Livello canale ${state.receiverStatus.channelDbfs.toFixed(1)} dBFS.`
+    : '';
   elements.decoderContent.innerHTML = `
     <div class="voice-viz">
-      <div><span class="signal-pill">● Uscita PortAudio</span><h3>${escapeHtml($('#voice-demod')?.value?.toUpperCase() || 'FM')} demodulation</h3><p>L’audio decodificato viene riprodotto dall’uscita predefinita del computer. Il waterfall resta indipendente dal percorso audio.</p></div>
+      <div><span class="signal-pill">● ${escapeHtml(squelchLabel)}</span><h3>${escapeHtml($('#voice-demod')?.value?.toUpperCase() || 'FM')} demodulation</h3><p>L’audio decodificato viene riprodotto dall’uscita predefinita del computer.${escapeHtml(channelLevel)} Il waterfall resta indipendente dal percorso audio.</p></div>
       <div class="audio-meter" aria-hidden="true">${Array.from({ length: 24 }, (_, index) => `<i style="animation-duration:${1 + (index % 7) * .13}s"></i>`).join('')}</div>
     </div>`;
 }
@@ -744,8 +839,29 @@ function handleSpectrum(message) {
   elements.peak.textContent = `${Number(message.max_dbfs).toFixed(1)} dBFS`;
   elements.fpsValue.textContent = `${state.measuredFps.toFixed(0)} FPS`;
   elements.fftValue.textContent = String(message.fft_size);
+  if (!state.liveTune.dragging) {
+    elements.tuningMarker.style.left = '50%';
+    elements.tuningTooltip.textContent = formatFrequency(state.centerHz, 4);
+  }
   waterfall.push(message.bins);
   scheduleSpectrumDraw();
+}
+
+function handleReceiverStatus(message) {
+  state.receiverStatus.channelDbfs = message.channel_dbfs;
+  state.receiverStatus.thresholdDbfs = message.squelch_threshold_dbfs;
+  state.receiverStatus.squelchOpen = message.squelch_open;
+  if (state.mode === 'live' && elements.protocol.value === 'voice') renderVoiceDecoder();
+}
+
+function handleTuned(message) {
+  if (!Number.isFinite(message.frequency_hz)) return;
+  state.centerHz = message.frequency_hz;
+  elements.frequency.value = (state.centerHz / 1e6).toFixed(6)
+    .replace(/0+$/, '').replace(/\.$/, '');
+  elements.title.innerHTML = `${(state.centerHz / 1e6).toFixed(3)} <small>MHz</small>`;
+  elements.tuningMarker.style.left = '50%';
+  elements.tuningTooltip.textContent = formatFrequency(state.centerHz, 4);
 }
 
 function handleScanTile(message) {
@@ -765,6 +881,8 @@ function connectEvents() {
       const message = JSON.parse(data);
       if (message.type === 'state') handleState(message);
       else if (message.type === 'spectrum') handleSpectrum(message);
+      else if (message.type === 'receiver_status') handleReceiverStatus(message);
+      else if (message.type === 'tuned') handleTuned(message);
       else if (message.type === 'scan_tile') handleScanTile(message);
       else if (message.type === 'decoder') handleDecoder(message.payload || {});
       else if (message.type === 'diagnostic') addLog(message.message, message.level);
@@ -808,6 +926,10 @@ elements.protocol.addEventListener('change', () => {
 elements.frequency.addEventListener('input', () => {
   elements.title.innerHTML = `${Number(elements.frequency.value || 0).toFixed(3)} <small>MHz</small>`;
 });
+elements.frequency.addEventListener('change', () => {
+  const frequencyHz = Number(elements.frequency.value) * 1e6;
+  if (Number.isFinite(frequencyHz)) void retuneLive(frequencyHz);
+});
 elements.scanStart.addEventListener('input', () => setMode('scan'));
 elements.scanEnd.addEventListener('input', () => setMode('scan'));
 elements.gainAuto.addEventListener('change', () => { elements.gainInput.disabled = elements.gainAuto.checked; });
@@ -815,8 +937,11 @@ elements.gainInput.addEventListener('input', () => { elements.gainOutput.textCon
 elements.fpsInput.addEventListener('input', () => { elements.fpsOutput.textContent = `${elements.fpsInput.value} FPS`; });
 
 [elements.spectrumCanvas, elements.waterfallCanvas].forEach((canvas) => {
-  canvas.addEventListener('dblclick', (event) => tuneLive(liveFrequencyFromPointer(event, canvas)));
+  canvas.addEventListener('pointerdown', beginLiveTune);
 });
+elements.tuningMarker.addEventListener('pointerdown', beginLiveTune);
+window.addEventListener('pointermove', moveLiveTune);
+window.addEventListener('pointerup', finishLiveTune);
 
 elements.scanCanvas.addEventListener('mousemove', (event) => {
   const rect = elements.scanCanvas.getBoundingClientRect();
@@ -859,7 +984,7 @@ elements.scanCanvas.addEventListener('wheel', (event) => {
 elements.scanCanvas.addEventListener('dblclick', (event) => {
   const rect = elements.scanCanvas.getBoundingClientRect();
   const ratio = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
-  tuneLive(state.scan.viewStartHz + ratio * (state.scan.viewEndHz - state.scan.viewStartHz));
+  openLiveAtFrequency(state.scan.viewStartHz + ratio * (state.scan.viewEndHz - state.scan.viewStartHz));
 });
 
 $$('.decoder-tab').forEach((tab) => tab.addEventListener('click', () => {

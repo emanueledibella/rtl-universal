@@ -17,27 +17,81 @@ make test
 Il binario generato è `rtl-universal`. `make strict` abilita anche tutti i
 warning usati come errori.
 
-## RTL Universal Studio: Live e Scan
+## Avvio
 
-Il progetto include una UI locale moderna per spettro, waterfall, sintonia e
-pannelli dedicati ai protocolli. Non richiede pacchetti npm: usa Node.js per il
-controller locale e il binario C per acquisizione, DSP e decoder.
+Eseguire i comandi seguenti dalla directory principale del progetto, dopo la
+compilazione. Collegare il dongle RTL-SDR prima di avviare una ricezione Live.
+
+### Da CLI
+
+Per controllare che il ricevitore sia visibile e conoscere indice e seriale:
+
+```sh
+./rtl-universal --list-devices
+```
+
+Avvio Voice FM a 145,500 MHz con squelch e statistiche ogni secondo:
+
+```sh
+./rtl-universal --mode voice --freq 145.500 --demod fm \
+  --filter-width 15000 --filter-type iir --squelch -30 --stats 1
+```
+
+Le altre modalità possono essere avviate direttamente con il relativo
+protocollo; AIS, ADS-B e RS41 usano la propria frequenza predefinita:
+
+```sh
+./rtl-universal --mode ais
+./rtl-universal --mode adsb
+./rtl-universal --mode sonde
+./rtl-universal --mode sstv --freq 145.800 --save-dir immagini-sstv
+```
+
+Usare `Ctrl+C` per terminare la ricezione. L'elenco completo degli argomenti è
+disponibile con:
+
+```sh
+./rtl-universal --help
+```
+
+### Con la GUI
+
+La GUI richiede Node.js, ma non è necessario eseguire `npm install` perché il
+progetto non usa dipendenze npm. Compilare il backend C e avviare il controller
+locale:
 
 ```sh
 make strict
 npm start
 ```
 
-Aprire quindi `http://127.0.0.1:4173` nel browser. In alternativa:
+Aprire quindi [http://127.0.0.1:4173](http://127.0.0.1:4173). Il controller
+avvia e arresta automaticamente `rtl-universal`: non serve lanciare il backend
+in un secondo terminale. In alternativa, compilazione e avvio della GUI possono
+essere eseguiti con un solo comando:
 
 ```sh
 make ui
 ```
 
+Se la porta `4173` è già occupata, se ne può scegliere un'altra:
+
+```sh
+RTL_UI_PORT=4174 npm start
+```
+
+## RTL Universal Studio: Live e Scan
+
+Il progetto include una UI locale moderna per spettro, waterfall, sintonia e
+pannelli dedicati ai protocolli. Non richiede pacchetti npm: usa Node.js per il
+controller locale e il binario C per acquisizione, DSP e decoder.
+
 La modalità **Live** acquisisce FFT in parallelo alla decodifica, fino a 60 FPS.
 Per Voice si può scegliere uno span istantaneo fino a 2,4 MHz, mantenendo il
-filtro audio stretto sul canale centrale. Un doppio clic su spettro o waterfall
-ricentra immediatamente la sessione.
+filtro audio stretto sul canale centrale. Un clic su spettro o waterfall
+sintonizza la frequenza scelta; la barra verticale può anche essere trascinata.
+Il cambio viene applicato al tuner in tempo reale, senza fermare o riavviare la
+sessione Live.
 
 La modalità **Scan** usa `rtl_power` per attraversare un intervallo ampio, per
 esempio 50–1700 MHz, e ricompone progressivamente i blocchi in una mappa unica.
@@ -50,6 +104,12 @@ del tuner, frequenza, FFT e refresh. Il pannello contestuale aggiunge AM/FM,
 sample rate, filtro e squelch per Voice; coordinate per ADS-B; canale AIS;
 formato e cartella di salvataggio per SSTV. Le tabelle ADS-B, AIS e RS41 sono
 alimentate dagli eventi JSON già prodotti dal decoder.
+
+In Voice, attivazione e soglia dello squelch vengono aggiornate anche durante
+la ricezione. Il pannello mostra sia il livello del canale post-filtro sia lo
+stato aperto/chiuso. Come punto di partenza è consigliata una soglia di
+`-30 dBFS`; va poi regolata rispetto al rumore realmente indicato (una soglia
+più negativa apre più facilmente lo squelch).
 
 ### FFT live dalla CLI
 

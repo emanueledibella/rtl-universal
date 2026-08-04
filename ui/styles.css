@@ -212,8 +212,12 @@ button { color: inherit; }
 .canvas-divider { border-top: 1px solid var(--line); }
 .gradient-legend { display: flex; align-items: center; gap: 8px; }
 .gradient-legend i { width: 90px; height: 4px; border-radius: 4px; background: linear-gradient(90deg, #080a16, #342174, #0c91b6, #6ef0c4, #ffe06b, #ff587d); }
-.tuning-marker { position: absolute; pointer-events: none; left: 50%; top: 28px; bottom: 0; width: 1px; background: rgba(255,255,255,.32); box-shadow: 0 0 12px rgba(255,255,255,.25); }
+.tuning-marker { position: absolute; pointer-events: auto; cursor: ew-resize; touch-action: none; left: 50%; top: 28px; bottom: 0; width: 1px; background: rgba(255,255,255,.38); box-shadow: 0 0 12px rgba(255,255,255,.25); z-index: 4; }
+.tuning-marker::before { content: ""; position: absolute; left: -9px; top: 0; bottom: 0; width: 19px; }
 .tuning-marker span { position: absolute; top: 0; left: -5px; width: 11px; height: 7px; background: var(--cyan); clip-path: polygon(0 0,100% 0,50% 100%); filter: drop-shadow(0 0 5px var(--cyan)); }
+.tuning-marker output { position: absolute; top: 12px; left: 8px; white-space: nowrap; padding: 4px 7px; border: 1px solid rgba(85,230,255,.22); border-radius: 6px; background: rgba(8,12,20,.88); color: var(--cyan); font: 8px ui-monospace, SFMono-Regular, Menlo, monospace; opacity: 0; transform: translateY(-3px); transition: opacity .15s, transform .15s; }
+.tuning-marker.dragging { background: var(--cyan); box-shadow: 0 0 15px rgba(85,230,255,.7); }
+.tuning-marker.dragging output, .tuning-marker:hover output { opacity: 1; transform: translateY(0); }
 
 .scan-canvas-wrap { border-top: 1px solid var(--line); background: #090c13; padding-top: 15px; }
 .scan-progress-row { padding: 0 22px 10px; display: flex; justify-content: space-between; align-items: center; }

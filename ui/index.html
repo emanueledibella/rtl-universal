@@ -114,14 +114,16 @@
             </div>
 
             <div id="live-visual" class="canvas-stack">
-              <div class="canvas-label"><span>Spettro</span><span>Doppio clic per sintonizzare</span></div>
+              <div class="canvas-label"><span>Spettro</span><span>Clicca o trascina la barra per sintonizzare</span></div>
               <canvas id="spectrum-canvas" aria-label="Spettro radio live"></canvas>
               <div class="canvas-divider">
                 <span>Waterfall</span>
                 <div class="gradient-legend"><small>−120</small><i></i><small>0 dBFS</small></div>
               </div>
               <canvas id="waterfall-canvas" aria-label="Waterfall radio live"></canvas>
-              <div id="tuning-marker" class="tuning-marker"><span></span></div>
+              <div id="tuning-marker" class="tuning-marker" title="Trascina per sintonizzare">
+                <span></span><output id="tuning-tooltip">145.500 MHz</output>
+              </div>
             </div>
 
             <div id="scan-visual" class="scan-canvas-wrap hidden">

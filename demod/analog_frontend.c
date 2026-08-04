@@ -53,10 +53,10 @@ int analog_frontend_init(analog_frontend_t *ctx,
         if (!ctx->iir) return 0;
     }
 
+    ctx->power_alpha = 1.0f
+                       - expf(-1.0f / ((float)sample_rate
+                                       * ANALOG_SQUELCH_SMOOTHING_SECONDS));
     if (cfg->squelch_enabled) {
-        ctx->power_alpha = 1.0f
-                           - expf(-1.0f / ((float)sample_rate
-                                           * ANALOG_SQUELCH_SMOOTHING_SECONDS));
         ctx->squelch_threshold = powf(10.0f, cfg->squelch_dbfs / 10.0f);
     } else {
         ctx->squelch_open = 1;
@@ -81,13 +81,35 @@ int analog_frontend_process(analog_frontend_t *ctx, float i, float q,
     *filtered_i = crealf(output);
     *filtered_q = cimagf(output);
 
-    if (ctx->cfg.squelch_enabled) {
+    {
         float power = (*filtered_i * *filtered_i + *filtered_q * *filtered_q)
                       / ANALOG_IQ_FULL_SCALE_POWER;
         ctx->power_estimate += ctx->power_alpha * (power - ctx->power_estimate);
+    }
+    if (ctx->cfg.squelch_enabled) {
         ctx->squelch_open = ctx->power_estimate >= ctx->squelch_threshold;
+    } else {
+        ctx->squelch_open = 1;
     }
     return ctx->squelch_open;
+}
+
+int analog_frontend_set_squelch(analog_frontend_t *ctx, int enabled,
+                                float threshold_dbfs) {
+    if (!ctx || (enabled && (!isfinite(threshold_dbfs)
+                             || threshold_dbfs < -120.0f
+                             || threshold_dbfs > 0.0f))) {
+        return 0;
+    }
+    ctx->cfg.squelch_enabled = enabled ? 1 : 0;
+    if (enabled) {
+        ctx->cfg.squelch_dbfs = threshold_dbfs;
+        ctx->squelch_threshold = powf(10.0f, threshold_dbfs / 10.0f);
+        ctx->squelch_open = ctx->power_estimate >= ctx->squelch_threshold;
+    } else {
+        ctx->squelch_open = 1;
+    }
+    return 1;
 }
 
 int analog_frontend_get_squelch_status(const analog_frontend_t *ctx,

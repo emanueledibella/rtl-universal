@@ -81,6 +81,35 @@ static int test_squelch(void) {
     return !open;
 }
 
+static int test_runtime_squelch(void) {
+    analog_frontend_config_t cfg = {ANALOG_FILTER_NONE, 0, 0, 0.0f};
+    analog_frontend_t frontend;
+    float filtered_i = 0.0f;
+    float filtered_q = 0.0f;
+    int open = 0;
+
+    if (!analog_frontend_init(&frontend, &cfg, 10000)) return 0;
+    for (int n = 0; n < 500; n++) {
+        open = analog_frontend_process(&frontend, 0.0f, 0.0f,
+                                       &filtered_i, &filtered_q);
+    }
+    if (!open || !analog_frontend_set_squelch(&frontend, 1, -20.0f)) {
+        analog_frontend_destroy(&frontend);
+        return 0;
+    }
+    open = analog_frontend_process(&frontend, 0.0f, 0.0f,
+                                   &filtered_i, &filtered_q);
+    if (open || analog_frontend_set_squelch(&frontend, 1, 1.0f)
+        || !analog_frontend_set_squelch(&frontend, 0, 0.0f)) {
+        analog_frontend_destroy(&frontend);
+        return 0;
+    }
+    open = analog_frontend_process(&frontend, 0.0f, 0.0f,
+                                   &filtered_i, &filtered_q);
+    analog_frontend_destroy(&frontend);
+    return open;
+}
+
 int main(void) {
     analog_frontend_config_t invalid = {ANALOG_FILTER_NONE, 1000, 0, 0.0f};
     analog_frontend_t frontend;
@@ -100,6 +129,10 @@ int main(void) {
     }
     if (!test_squelch()) {
         fprintf(stderr, "squelch smoothing/closing test failed\n");
+        return 1;
+    }
+    if (!test_runtime_squelch()) {
+        fprintf(stderr, "runtime squelch update test failed\n");
         return 1;
     }
     puts("[ANALOG] frontend filter/squelch test_result=PASS");

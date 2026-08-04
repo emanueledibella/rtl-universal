@@ -3,6 +3,7 @@
 #include <complex.h>
 #include <math.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -13,7 +14,7 @@
 
 struct spectrum_analyzer {
     int sample_rate;
-    uint32_t center_frequency_hz;
+    _Atomic uint32_t center_frequency_hz;
     unsigned int fft_size;
     uint64_t skip_samples;
     uint64_t skip_remaining;
@@ -105,7 +106,9 @@ static void emit_spectrum_frame(spectrum_analyzer_t *ctx,
                   "{\"type\":\"spectrum\",\"center_hz\":%u,"
                   "\"sample_rate\":%d,\"fft_size\":%u,"
                   "\"min_dbfs\":%.1f,\"max_dbfs\":%.1f,\"bins\":[",
-                  ctx->center_frequency_hz, ctx->sample_rate, ctx->fft_size,
+                  atomic_load_explicit(&ctx->center_frequency_hz,
+                                       memory_order_relaxed),
+                  ctx->sample_rate, ctx->fft_size,
                   minimum, maximum);
     for (unsigned int i = 0u; i < ctx->fft_size; i++) {
         if (i > 0u) (void)fputc(',', ctx->output);
@@ -165,7 +168,7 @@ spectrum_analyzer_t *spectrum_analyzer_create(int sample_rate,
     ctx = (spectrum_analyzer_t *)calloc(1u, sizeof(*ctx));
     if (!ctx) return NULL;
     ctx->sample_rate = sample_rate;
-    ctx->center_frequency_hz = center_frequency_hz;
+    atomic_init(&ctx->center_frequency_hz, center_frequency_hz);
     ctx->fft_size = fft_size;
     ctx->frames_per_second = frames_per_second;
     ctx->output = output;
@@ -216,6 +219,13 @@ void spectrum_analyzer_feed_u8(spectrum_analyzer_t *ctx,
         ctx->capture_count = 0u;
         ctx->skip_remaining = ctx->skip_samples;
     }
+}
+
+void spectrum_analyzer_set_center_frequency(spectrum_analyzer_t *ctx,
+                                            uint32_t center_frequency_hz) {
+    if (!ctx || center_frequency_hz == 0u) return;
+    atomic_store_explicit(&ctx->center_frequency_hz, center_frequency_hz,
+                          memory_order_relaxed);
 }
 
 void spectrum_analyzer_destroy(spectrum_analyzer_t *ctx) {

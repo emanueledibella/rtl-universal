@@ -26,6 +26,9 @@ void spectrum_analyzer_feed_u8(spectrum_analyzer_t *ctx,
                                const unsigned char *samples,
                                uint32_t length);
 
+void spectrum_analyzer_set_center_frequency(spectrum_analyzer_t *ctx,
+                                            uint32_t center_frequency_hz);
+
 void spectrum_analyzer_destroy(spectrum_analyzer_t *ctx);
 
 /* Exposed for deterministic tests and offline tooling. */

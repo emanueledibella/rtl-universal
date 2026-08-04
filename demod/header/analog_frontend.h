@@ -34,6 +34,8 @@ int analog_frontend_init(analog_frontend_t *ctx,
                          int sample_rate);
 int analog_frontend_process(analog_frontend_t *ctx, float i, float q,
                             float *filtered_i, float *filtered_q);
+int analog_frontend_set_squelch(analog_frontend_t *ctx, int enabled,
+                                float threshold_dbfs);
 int analog_frontend_get_squelch_status(const analog_frontend_t *ctx,
                                        float *level_dbfs,
                                        float *threshold_dbfs,
