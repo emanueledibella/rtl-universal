@@ -79,6 +79,8 @@ const state = {
   mode: 'live',
   processMode: 'idle',
   processStatus: 'stopped',
+  activeSessionId: null,
+  protocolSwitchPending: false,
   centerHz: 145_500_000,
   channelHz: 145_500_000,
   sampleRate: 2_400_000,
@@ -133,6 +135,19 @@ let frequencyRetuneTimer = null;
 let gainUpdateTimer = null;
 let channelWheelCommitTimer = null;
 let channelWheelFeedbackTimer = null;
+let protocolSwitchGeneration = 0;
+
+function protocolSampleRate(protocol) {
+  if (protocol === 'voice') {
+    return Number($('#voice-sample-rate')?.value || 2_400_000);
+  }
+  return {
+    adsb: 2_000_000,
+    ais: 2_400_000,
+    sonde: 240_000,
+    sstv: 240_000,
+  }[protocol] || 2_400_000;
+}
 
 function livePlotMetrics(totalWidth) {
   const width = Math.max(1, Number(totalWidth) || 1);
@@ -337,6 +352,14 @@ const waterfall = {
   pixels: null,
   canvas: document.createElement('canvas'),
   context: null,
+
+  clear() {
+    this.width = 0;
+    this.pixels = null;
+    this.context = null;
+    this.canvas.width = 1;
+    this.canvas.height = this.height;
+  },
 
   reset(width) {
     this.width = width;
@@ -706,10 +729,29 @@ async function toggleRecording(kind) {
 
 function updateSpanLabel() {
   const protocol = elements.protocol.value;
-  const rates = { adsb: 2_000_000, ais: 2_400_000, sonde: 240_000, sstv: 240_000 };
-  const sampleRate = protocol === 'voice' ? Number($('#voice-sample-rate')?.value || 2_400_000) : rates[protocol];
+  const sampleRate = protocolSampleRate(protocol);
   elements.span.textContent = formatFrequency(sampleRate, sampleRate >= 1e6 ? 3 : 0);
   updateFilterBand();
+}
+
+function resetLiveSpectrum(protocol, centerHz) {
+  state.latestBins = null;
+  state.centerHz = centerHz;
+  state.channelHz = centerHz;
+  state.sampleRate = protocolSampleRate(protocol);
+  state.framesThisSecond = 0;
+  state.measuredFps = 0;
+  state.lastFpsAt = performance.now();
+  state.receiverStatus = { channelDbfs: null, thresholdDbfs: null, squelchOpen: null };
+  waterfall.clear();
+  elements.peak.textContent = '— dBFS';
+  elements.fpsValue.textContent = '— FPS';
+  elements.fftValue.textContent = elements.fftSize.value;
+  elements.span.textContent = formatFrequency(
+    state.sampleRate, state.sampleRate >= 1e6 ? 3 : 0,
+  );
+  positionLiveChannelMarker();
+  scheduleSpectrumDraw();
 }
 
 function renderGainOutput() {
@@ -1308,6 +1350,12 @@ function addLog(message, level = 'info') {
 function handleState(message) {
   state.processMode = message.mode;
   state.processStatus = message.status;
+  state.activeSessionId = message.sessionId || null;
+  if (message.mode === 'live' && message.sessionId && message.protocol
+      && elements.protocol.value !== message.protocol) {
+    elements.protocol.value = message.protocol;
+    updateProtocolControls();
+  }
   if (message.audioRecording) state.recordings.audio = { ...message.audioRecording };
   if (message.iqRecording) state.recordings.iq = { ...message.iqRecording };
   if (typeof message.manualGain === 'boolean') {
@@ -1334,7 +1382,7 @@ function handleState(message) {
     }
   }
   const active = ['starting', 'receiving', 'scanning', 'stopping'].includes(message.status);
-  setBusy(active && message.status !== 'stopping');
+  setBusy(state.protocolSwitchPending || (active && message.status !== 'stopping'));
   elements.stop.disabled = !active || message.status === 'stopping';
   const labels = {
     stopped: ['Pronto', 'Ricevitore fermo'],
@@ -1349,7 +1397,9 @@ function handleState(message) {
   elements.statusLabel.textContent = label;
   elements.statusDetail.textContent = detail;
   elements.connectionLight.className = `connection-light ${active ? 'active' : message.status === 'error' ? 'error' : ''}`;
-  if (message.status === 'error' || message.status === 'complete' || message.status === 'stopped') setBusy(false);
+  if (!state.protocolSwitchPending
+      && (message.status === 'error' || message.status === 'complete'
+          || message.status === 'stopped')) setBusy(false);
   if (message.progress !== undefined) updateScanProgress(message.progress);
   renderRecordingControls();
 }
@@ -1375,6 +1425,11 @@ function handleSpectrum(message) {
   }
   waterfall.push(message.bins);
   scheduleSpectrumDraw();
+}
+
+function isCurrentSessionEvent(message) {
+  return Boolean(message.sessionId)
+    && message.sessionId === state.activeSessionId;
 }
 
 function handleReceiverStatus(message) {
@@ -1417,13 +1472,13 @@ function connectEvents() {
     try {
       const message = JSON.parse(data);
       if (message.type === 'state') handleState(message);
-      else if (message.type === 'spectrum') handleSpectrum(message);
-      else if (message.type === 'receiver_status') handleReceiverStatus(message);
-      else if (message.type === 'tuned') handleTuned(message);
-      else if (message.type === 'channel_tuned') handleChannelTuned(message);
+      else if (message.type === 'spectrum' && isCurrentSessionEvent(message)) handleSpectrum(message);
+      else if (message.type === 'receiver_status' && isCurrentSessionEvent(message)) handleReceiverStatus(message);
+      else if (message.type === 'tuned' && isCurrentSessionEvent(message)) handleTuned(message);
+      else if (message.type === 'channel_tuned' && isCurrentSessionEvent(message)) handleChannelTuned(message);
       else if (message.type === 'gain_failed') toast(message.message || 'Modifica gain non riuscita', 'error');
-      else if (message.type === 'scan_tile') handleScanTile(message);
-      else if (message.type === 'decoder') handleDecoder(message.payload || {});
+      else if (message.type === 'scan_tile' && isCurrentSessionEvent(message)) handleScanTile(message);
+      else if (message.type === 'decoder' && isCurrentSessionEvent(message)) handleDecoder(message.payload || {});
       else if (message.type === 'diagnostic') addLog(message.message, message.level);
       else if (message.type === 'process_exit' && !message.expected && message.code !== 0) addLog(`${message.kind} exited with code ${message.code ?? message.signal}`, 'error');
     } catch (error) {
@@ -1460,10 +1515,43 @@ elements.refreshDevices.addEventListener('click', refreshDevices);
 elements.copyChannelFrequency.addEventListener('click', copyChannelFrequencyHz);
 elements.audioRecordingButton.addEventListener('click', () => toggleRecording('audio'));
 elements.iqRecordingButton.addEventListener('click', () => toggleRecording('iq'));
-elements.protocol.addEventListener('change', () => {
-  syncFrequencyEditor(protocolDefaults[elements.protocol.value] * 1e6);
+elements.protocol.addEventListener('change', async () => {
+  const generation = ++protocolSwitchGeneration;
+  const protocol = elements.protocol.value;
+  const centerHz = protocolDefaults[protocol] * 1e6;
+  syncFrequencyEditor(centerHz);
   updateProtocolControls();
   setMode('live');
+  resetLiveSpectrum(protocol, centerHz);
+
+  const sessionIsLive = state.processMode === 'live'
+    && ['starting', 'receiving'].includes(state.processStatus);
+  if (!sessionIsLive) return;
+
+  // Reject any late FFT/decoder frames from the session being replaced.
+  state.activeSessionId = null;
+  state.protocolSwitchPending = true;
+  elements.protocol.disabled = true;
+  setBusy(true);
+  try {
+    await api('/api/live/start', {
+      method: 'POST',
+      body: JSON.stringify(collectLiveConfig()),
+    });
+    if (generation === protocolSwitchGeneration) {
+      toast(`${protocol.toUpperCase()} attivo a ${(centerHz / 1e6).toFixed(3)} MHz`);
+    }
+  } catch (error) {
+    if (generation === protocolSwitchGeneration) toast(error.message, 'error');
+  } finally {
+    if (generation === protocolSwitchGeneration) {
+      state.protocolSwitchPending = false;
+      elements.protocol.disabled = false;
+      const active = ['starting', 'receiving'].includes(state.processStatus);
+      setBusy(active);
+      elements.stop.disabled = !active;
+    }
+  }
 });
 elements.frequencyDigits.addEventListener('pointerover', (event) => {
   const control = event.target.closest('.frequency-digit-control');

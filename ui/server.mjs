@@ -16,6 +16,7 @@ const port = Number.parseInt(process.env.RTL_UI_PORT || '4173', 10);
 const clients = new Set();
 const artifacts = new Map();
 let activeSession = null;
+let sessionTransition = Promise.resolve();
 const stoppedRecording = Object.freeze({ active: false, path: '', format: '', bytes: 0 });
 let currentState = {
   mode: 'idle',
@@ -140,6 +141,41 @@ function registerArtifact(event) {
   return { ...event, artifact_url: `/api/artifacts/${id}` };
 }
 
+function waitForChildExit(child, timeoutMs) {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return Promise.resolve(true);
+  }
+  return new Promise((resolveExit) => {
+    let settled = false;
+    const finish = (exited) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      child.off('exit', onExit);
+      resolveExit(exited);
+    };
+    const onExit = () => finish(true);
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    child.once('exit', onExit);
+  });
+}
+
+async function terminateChild(child) {
+  if (child.exitCode !== null || child.signalCode !== null) return true;
+  child.kill('SIGINT');
+  if (await waitForChildExit(child, 1500)) return true;
+  child.kill('SIGTERM');
+  if (await waitForChildExit(child, 750)) return true;
+  child.kill('SIGKILL');
+  return waitForChildExit(child, 500);
+}
+
+function queueSessionTransition(action) {
+  const transition = sessionTransition.then(action, action);
+  sessionTransition = transition.catch(() => {});
+  return transition;
+}
+
 async function stopActive(reason = 'user') {
   const session = activeSession;
   if (!session) {
@@ -154,15 +190,16 @@ async function stopActive(reason = 'user') {
   }
   activeSession = null;
   session.stopping = true;
-  updateState({ status: 'stopping' });
+  updateState({ status: 'stopping', sessionId: null });
   broadcast({ type: 'diagnostic', level: 'info', message: `Stopping ${session.kind} session (${reason})` });
 
-  if (session.child.exitCode === null) session.child.kill('SIGINT');
-  await Promise.race([
-    new Promise((resolveExit) => session.child.once('exit', resolveExit)),
-    new Promise((resolveTimeout) => setTimeout(resolveTimeout, 1500)),
-  ]);
-  if (session.child.exitCode === null) session.child.kill('SIGTERM');
+  if (!await terminateChild(session.child)) {
+    broadcast({
+      type: 'diagnostic',
+      level: 'error',
+      message: `${session.kind} session did not exit after SIGKILL`,
+    });
+  }
   updateState({
     mode: 'idle',
     status: 'stopped',
@@ -739,7 +776,8 @@ const server = createServer(async (request, response) => {
       return;
     }
     if (request.method === 'POST' && url.pathname === '/api/live/start') {
-      sendJson(response, 202, await startLive(await readJsonBody(request)));
+      const config = await readJsonBody(request);
+      sendJson(response, 202, await queueSessionTransition(() => startLive(config)));
       return;
     }
     if (request.method === 'POST' && url.pathname === '/api/live/tune') {
@@ -767,11 +805,12 @@ const server = createServer(async (request, response) => {
       return;
     }
     if (request.method === 'POST' && url.pathname === '/api/scan/start') {
-      sendJson(response, 202, await startScan(await readJsonBody(request)));
+      const config = await readJsonBody(request);
+      sendJson(response, 202, await queueSessionTransition(() => startScan(config)));
       return;
     }
     if (request.method === 'POST' && url.pathname === '/api/stop') {
-      await stopActive('user');
+      await queueSessionTransition(() => stopActive('user'));
       sendJson(response, 200, { ok: true });
       return;
     }
