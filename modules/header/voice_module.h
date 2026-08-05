@@ -5,6 +5,7 @@
 
 #include "demodulator.h"
 #include "voice_decoder.h"
+#include "recording.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -31,6 +32,7 @@ typedef struct {
     void *stream;
     int pa_initialized;
     int audio_fs;
+    recording_writer_t audio_recorder;
 } voice_module_t;
 
 void voice_module_reset(voice_module_t *ctx);
@@ -39,6 +41,15 @@ const char *voice_module_demod_name(const voice_module_t *ctx);
 void voice_module_get_demod_config(voice_module_t *ctx, demod_config_t *cfg);
 int voice_module_init(voice_module_t *ctx, const demod_config_t *cfg);
 demod_output_t voice_module_get_demod_output(voice_module_t *ctx);
+int voice_module_start_recording(voice_module_t *ctx,
+                                 const char *path,
+                                 recording_format_t format);
+uint64_t voice_module_stop_recording(voice_module_t *ctx,
+                                     int *write_failed);
+int voice_module_recording_active(voice_module_t *ctx);
+int voice_module_recording_path(voice_module_t *ctx,
+                                char *path,
+                                size_t path_size);
 void voice_module_flush(voice_module_t *ctx);
 
 #ifdef __cplusplus

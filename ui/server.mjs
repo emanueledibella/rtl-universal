@@ -1,8 +1,8 @@
-import { createReadStream, existsSync, statSync } from 'node:fs';
+import { createReadStream, existsSync, mkdirSync, statSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { extname, join, resolve } from 'node:path';
+import { dirname, extname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
 
@@ -16,7 +16,17 @@ const port = Number.parseInt(process.env.RTL_UI_PORT || '4173', 10);
 const clients = new Set();
 const artifacts = new Map();
 let activeSession = null;
-let currentState = { mode: 'idle', status: 'stopped', sessionId: null };
+const stoppedRecording = Object.freeze({ active: false, path: '', format: '', bytes: 0 });
+let currentState = {
+  mode: 'idle',
+  status: 'stopped',
+  sessionId: null,
+  manualGain: false,
+  gainDb: 20,
+  appliedGainDb: null,
+  audioRecording: { ...stoppedRecording },
+  iqRecording: { ...stoppedRecording },
+};
 
 const contentTypes = {
   '.html': 'text/html; charset=utf-8',
@@ -77,6 +87,44 @@ function optionalText(value, fallback = '') {
   return String(value).trim();
 }
 
+const recordingFormats = {
+  audio: new Set(['wav-s16', 'wav-f32', 's16le', 'f32le']),
+  iq: new Set(['cu8', 'cs16le', 'cf32le', 'wav-iq-s16', 'sigmf-cu8']),
+};
+
+const recordingExtensions = {
+  'wav-s16': '.wav',
+  'wav-f32': '.wav',
+  s16le: '.s16',
+  f32le: '.f32',
+  cu8: '.cu8',
+  cs16le: '.cs16',
+  cf32le: '.cf32',
+  'wav-iq-s16': '.wav',
+  'sigmf-cu8': '.sigmf-data',
+};
+
+function prepareRecording(kind, requestedFormat, requestedPath) {
+  const format = optionalText(requestedFormat,
+    kind === 'audio' ? 'wav-s16' : 'cu8').toLowerCase();
+  if (!recordingFormats[kind]?.has(format)) {
+    throw new Error(kind === 'audio'
+      ? 'Audio format must be wav-s16, wav-f32, s16le or f32le'
+      : 'IQ format must be cu8, cs16le, cf32le, wav-iq-s16 or sigmf-cu8');
+  }
+  let path = optionalText(requestedPath);
+  if (/[\x00\r\n]/.test(path) || path.length > 3500) {
+    throw new Error('Invalid recording path');
+  }
+  if (!path) {
+    const timestamp = new Date().toISOString().replaceAll(':', '-').replaceAll('.', '-');
+    path = join('registrazioni', `${kind}-${timestamp}${recordingExtensions[format]}`);
+  }
+  path = resolve(projectRoot, path);
+  mkdirSync(dirname(path), { recursive: true });
+  return { format, path };
+}
+
 function attachLineReader(stream, handler) {
   if (!stream) return;
   const lines = createInterface({ input: stream, crlfDelay: Infinity });
@@ -95,7 +143,13 @@ function registerArtifact(event) {
 async function stopActive(reason = 'user') {
   const session = activeSession;
   if (!session) {
-    updateState({ mode: 'idle', status: 'stopped', sessionId: null });
+    updateState({
+      mode: 'idle',
+      status: 'stopped',
+      sessionId: null,
+      audioRecording: { ...stoppedRecording },
+      iqRecording: { ...stoppedRecording },
+    });
     return;
   }
   activeSession = null;
@@ -109,7 +163,13 @@ async function stopActive(reason = 'user') {
     new Promise((resolveTimeout) => setTimeout(resolveTimeout, 1500)),
   ]);
   if (session.child.exitCode === null) session.child.kill('SIGTERM');
-  updateState({ mode: 'idle', status: 'stopped', sessionId: null });
+  updateState({
+    mode: 'idle',
+    status: 'stopped',
+    sessionId: null,
+    audioRecording: { ...stoppedRecording },
+    iqRecording: { ...stoppedRecording },
+  });
 }
 
 function trackChild(child, session) {
@@ -117,7 +177,13 @@ function trackChild(child, session) {
     broadcast({ type: 'diagnostic', level: 'error', message: error.message });
     if (activeSession?.id === session.id) {
       activeSession = null;
-      updateState({ mode: 'idle', status: 'error', sessionId: null });
+      updateState({
+        mode: 'idle',
+        status: 'error',
+        sessionId: null,
+        audioRecording: { ...stoppedRecording },
+        iqRecording: { ...stoppedRecording },
+      });
     }
   });
   child.on('exit', (code, signal) => {
@@ -135,6 +201,8 @@ function trackChild(child, session) {
         mode: 'idle',
         status: code === 0 ? 'complete' : 'error',
         sessionId: null,
+        audioRecording: { ...stoppedRecording },
+        iqRecording: { ...stoppedRecording },
         ...(session.kind === 'scan' && code === 0 ? { progress: 1 } : {}),
       });
     }
@@ -155,6 +223,8 @@ async function startLive(config) {
   if ((fftSize & (fftSize - 1)) !== 0) throw new Error('FFT size must be a power of two');
   const fps = finiteNumber(config.fps ?? 30, 'spectrum FPS', 1, 60);
   const device = optionalText(config.device, '0');
+  const manualGain = Boolean(config.manualGain);
+  const gainDb = integerNumber(config.gainDb ?? 20, 'gain', 0, 50);
   const args = [
     '--mode', protocol,
     '--freq', String(frequencyMhz),
@@ -168,9 +238,7 @@ async function startLive(config) {
     '--spectrum-fps', String(fps),
   ];
 
-  if (config.manualGain) {
-    args.push('--gain', String(integerNumber(config.gainDb ?? 20, 'gain', 0, 50)));
-  }
+  if (manualGain) args.push('--gain', String(gainDb));
   const ppm = integerNumber(config.ppm ?? 0, 'PPM', -200, 200);
   if (ppm !== 0) args.push('--ppm', String(ppm));
   const tunerBandwidth = integerNumber(config.tunerBandwidth ?? 0, 'tuner bandwidth', 0, 3200000);
@@ -224,6 +292,9 @@ async function startLive(config) {
       protocol,
       frequencyMhz,
       channelFrequencyMhz: frequencyMhz,
+      manualGain,
+      gainDb,
+      appliedGainDb: null,
     },
   };
   activeSession = session;
@@ -266,6 +337,73 @@ async function startLive(config) {
         offset_hz: Number(channel[3]),
       });
     }
+    const gainChanged = trimmed.match(/\[(?:CONTROL|RX)] event=gain mode=(auto|manual)(?: requested_db=(\d+) applied_db=([-+\d.]+))?/);
+    if (gainChanged) {
+      const manualGain = gainChanged[1] === 'manual';
+      const gainDb = manualGain ? Number(gainChanged[2]) : Number(session.config.gainDb ?? 20);
+      const appliedGainDb = manualGain ? Number(gainChanged[3]) : null;
+      session.config.manualGain = manualGain;
+      session.config.gainDb = gainDb;
+      session.config.appliedGainDb = appliedGainDb;
+      session.pendingGain = null;
+      updateState({ manualGain, gainDb, appliedGainDb, gainError: '' });
+    }
+    const gainPending = trimmed.match(/\[CONTROL] event=gain-pending mode=(auto|manual) requested_db=(\d+)/);
+    if (gainPending) {
+      const manualGain = gainPending[1] === 'manual';
+      const gainDb = Number(gainPending[2]);
+      session.config.manualGain = manualGain;
+      session.config.gainDb = gainDb;
+      session.config.appliedGainDb = null;
+      session.pendingGain = null;
+      updateState({ manualGain, gainDb, appliedGainDb: null, gainError: '' });
+    }
+    const gainFailed = trimmed.match(/\[(?:CONTROL|RX)] event=gain-failed mode=(auto|manual)(?: .*reason=([^ ]+)| .*stage=([^ ]+) error=(-?\d+))?/);
+    if (gainFailed) {
+      const previous = session.pendingGain;
+      session.pendingGain = null;
+      if (previous) {
+        session.config.manualGain = previous.manualGain;
+        session.config.gainDb = previous.gainDb;
+        session.config.appliedGainDb = previous.appliedGainDb;
+        updateState({
+          manualGain: previous.manualGain,
+          gainDb: previous.gainDb,
+          appliedGainDb: previous.appliedGainDb,
+          gainError: 'Il tuner ha rifiutato la modifica del gain',
+        });
+      }
+      broadcast({
+        type: 'gain_failed',
+        sessionId: session.id,
+        message: 'Il tuner ha rifiutato la modifica del gain',
+      });
+    }
+    const recordingFailed = trimmed.match(/\[CONTROL] event=record-failed kind=(audio|iq)/);
+    if (recordingFailed) {
+      const key = recordingFailed[1] === 'audio' ? 'audioRecording' : 'iqRecording';
+      updateState({
+        [key]: {
+          ...currentState[key],
+          active: false,
+          stopping: false,
+          error: 'Cannot start recording; check the destination path',
+        },
+      });
+    }
+    const recordingStopped = trimmed.match(/\[CONTROL] event=record-stopped kind=(audio|iq) bytes=(\d+) status=(\S+)/);
+    if (recordingStopped) {
+      const key = recordingStopped[1] === 'audio' ? 'audioRecording' : 'iqRecording';
+      updateState({
+        [key]: {
+          ...currentState[key],
+          active: false,
+          stopping: false,
+          bytes: Number(recordingStopped[2]),
+          error: recordingStopped[3] === 'ok' ? '' : 'Recording ended with a write error',
+        },
+      });
+    }
     broadcast({ type: 'diagnostic', level: /error|failed|invalid/i.test(trimmed) ? 'error' : 'info', source: 'receiver', message: trimmed });
   });
   attachLineReader(child.stdio[3], (line) => {
@@ -280,8 +418,13 @@ async function startLive(config) {
           protocol,
           frequencyMhz,
           channelFrequencyMhz: session.config.channelFrequencyMhz,
+          manualGain: session.config.manualGain,
+          gainDb: session.config.gainDb,
+          appliedGainDb: session.config.appliedGainDb,
           filterWidth: protocol === 'voice' ? Number(session.config.filterWidth || 15000) : null,
           filterType: protocol === 'voice' ? String(session.config.filterType || 'iir') : null,
+          audioRecording: currentState.audioRecording,
+          iqRecording: currentState.iqRecording,
         });
       }
       broadcast({ ...payload, sessionId: session.id });
@@ -297,8 +440,13 @@ async function startLive(config) {
     protocol,
     frequencyMhz,
     channelFrequencyMhz: frequencyMhz,
+    manualGain,
+    gainDb,
+    appliedGainDb: null,
     filterWidth: protocol === 'voice' ? Number(session.config.filterWidth || 15000) : null,
     filterType: protocol === 'voice' ? String(session.config.filterType || 'iir') : null,
+    audioRecording: { ...stoppedRecording },
+    iqRecording: { ...stoppedRecording },
   });
   return { sessionId: session.id, args };
 }
@@ -378,6 +526,24 @@ function setLiveSquelch(config) {
   return { sessionId: session.id, enabled, thresholdDbfs };
 }
 
+function setLiveGain(config) {
+  const session = activeSession;
+  if (!session || session.kind !== 'live') throw new Error('No active Live session');
+  const manualGain = Boolean(config.manualGain);
+  const gainDb = integerNumber(config.gainDb ?? session.config.gainDb ?? 20,
+    'gain', 0, 50);
+  session.pendingGain = {
+    manualGain: Boolean(session.config.manualGain),
+    gainDb: Number(session.config.gainDb ?? 20),
+    appliedGainDb: Number.isFinite(session.config.appliedGainDb)
+      ? session.config.appliedGainDb : null,
+    requestedManualGain: manualGain,
+    requestedGainDb: gainDb,
+  };
+  writeLiveControl(manualGain ? `GAIN MANUAL ${gainDb}` : 'GAIN AUTO');
+  return { sessionId: session.id, manualGain, gainDb };
+}
+
 function setLiveFilter(config) {
   const session = activeSession;
   if (!session || session.kind !== 'live' || session.config.protocol !== 'voice') {
@@ -395,6 +561,41 @@ function setLiveFilter(config) {
   session.config.filterType = type;
   updateState({ filterWidth: widthHz, filterType: type });
   return { sessionId: session.id, widthHz, type };
+}
+
+function setLiveRecording(config) {
+  const session = activeSession;
+  if (!session || session.kind !== 'live') throw new Error('No active Live session');
+  const kind = optionalText(config.kind).toLowerCase();
+  const action = optionalText(config.action).toLowerCase();
+  if (!['audio', 'iq'].includes(kind)) throw new Error('Recording kind must be audio or iq');
+  if (!['start', 'stop'].includes(action)) throw new Error('Recording action must be start or stop');
+  if (kind === 'audio' && session.config.protocol !== 'voice') {
+    throw new Error('Audio recording requires an active Voice session');
+  }
+  const key = kind === 'audio' ? 'audioRecording' : 'iqRecording';
+  const current = currentState[key] || { ...stoppedRecording };
+  if (action === 'stop') {
+    if (!current.active) throw new Error(`${kind.toUpperCase()} recording is not active`);
+    writeLiveControl(kind === 'audio' ? 'RECORD_AUDIO STOP' : 'RECORD_IQ STOP');
+    updateState({ [key]: { ...current, active: false, stopping: true } });
+    return { sessionId: session.id, kind, action };
+  }
+  if (current.active) throw new Error(`${kind.toUpperCase()} recording is already active`);
+  const recording = prepareRecording(kind, config.format, config.path);
+  const command = kind === 'audio' ? 'RECORD_AUDIO' : 'RECORD_IQ';
+  writeLiveControl(`${command} START ${recording.format} ${recording.path}`);
+  const state = {
+    active: true,
+    stopping: false,
+    path: recording.path,
+    format: recording.format,
+    bytes: 0,
+    startedAt: new Date().toISOString(),
+    error: '',
+  };
+  updateState({ [key]: state });
+  return { sessionId: session.id, kind, action, ...recording };
 }
 
 function parseRtlPowerLine(line, config, session) {
@@ -553,8 +754,16 @@ const server = createServer(async (request, response) => {
       sendJson(response, 202, setLiveSquelch(await readJsonBody(request)));
       return;
     }
+    if (request.method === 'POST' && url.pathname === '/api/live/gain') {
+      sendJson(response, 202, setLiveGain(await readJsonBody(request)));
+      return;
+    }
     if (request.method === 'POST' && url.pathname === '/api/live/filter') {
       sendJson(response, 202, setLiveFilter(await readJsonBody(request)));
+      return;
+    }
+    if (request.method === 'POST' && url.pathname === '/api/live/recording') {
+      sendJson(response, 202, setLiveRecording(await readJsonBody(request)));
       return;
     }
     if (request.method === 'POST' && url.pathname === '/api/scan/start') {

@@ -61,7 +61,10 @@ static int voice_module_pa_cb(const void *input, void *output,
 }
 
 static void voice_module_audio_out_cb(void *user, const float *samples, uint32_t n) {
-    voice_module_ring_push((voice_module_t *)user, samples, n);
+    voice_module_t *ctx = (voice_module_t *)user;
+    if (!ctx) return;
+    recording_writer_write_audio_f32(&ctx->audio_recorder, samples, n);
+    voice_module_ring_push(ctx, samples, n);
 }
 
 static void voice_module_on_demod_sample_cb(void *user, float sample) {
@@ -133,6 +136,7 @@ int voice_module_init(voice_module_t *ctx, const demod_config_t *cfg) {
     ctx->audio_fs = cfg->output_fs;
     ctx->ring_w = 0u;
     ctx->ring_r = 0u;
+    recording_writer_init(&ctx->audio_recorder);
 
     if (pthread_mutex_init(&ctx->ring_lock, NULL) != 0) {
         fprintf(stderr, "[voice] pthread_mutex_init failed\n");
@@ -190,10 +194,36 @@ demod_output_t voice_module_get_demod_output(voice_module_t *ctx) {
     return out;
 }
 
+int voice_module_start_recording(voice_module_t *ctx,
+                                 const char *path,
+                                 recording_format_t format) {
+    if (!ctx || ctx->audio_fs <= 0) return 0;
+    return recording_writer_start_audio(&ctx->audio_recorder, path, format,
+                                        ctx->audio_fs);
+}
+
+uint64_t voice_module_stop_recording(voice_module_t *ctx,
+                                     int *write_failed) {
+    if (!ctx) return 0u;
+    return recording_writer_stop(&ctx->audio_recorder, write_failed);
+}
+
+int voice_module_recording_active(voice_module_t *ctx) {
+    return ctx && recording_writer_is_active(&ctx->audio_recorder);
+}
+
+int voice_module_recording_path(voice_module_t *ctx,
+                                char *path,
+                                size_t path_size) {
+    return ctx && recording_writer_get_path(&ctx->audio_recorder, path,
+                                            path_size);
+}
+
 void voice_module_flush(voice_module_t *ctx) {
     if (!ctx) return;
 
     voice_decoder_flush(&ctx->decoder);
+    (void)voice_module_stop_recording(ctx, NULL);
 
     if (ctx->stream) {
         Pa_StopStream((PaStream *)ctx->stream);
@@ -208,4 +238,5 @@ void voice_module_flush(voice_module_t *ctx) {
         pthread_mutex_destroy(&ctx->ring_lock);
         ctx->ring_lock_ready = 0;
     }
+    recording_writer_destroy(&ctx->audio_recorder);
 }

@@ -8,6 +8,7 @@ TARGET = rtl-universal
 SRC = rtl-universal.c $(wildcard modules/*.c) $(wildcard demod/*.c) $(wildcard utility/*.c)
 ANALOG_TEST_TARGET = tests/analog_frontend_test
 SPECTRUM_TEST_TARGET = tests/spectrum_test
+RECORDING_TEST_TARGET = tests/recording_test
 
 .PHONY: all clean strict test ui ui-check
 
@@ -17,11 +18,11 @@ $(TARGET): $(SRC)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(SRC) -o $@ $(LDFLAGS) $(LDLIBS)
 
 clean:
-	rm -f $(TARGET) $(ANALOG_TEST_TARGET) $(SPECTRUM_TEST_TARGET) antenna.o
+	rm -f $(TARGET) $(ANALOG_TEST_TARGET) $(SPECTRUM_TEST_TARGET) $(RECORDING_TEST_TARGET) antenna.o
 	rm -rf $(TARGET).dSYM
 
 strict: clean
-	$(MAKE) CFLAGS="$(CFLAGS) -Wall -Wextra -Wpedantic -Werror" all $(ANALOG_TEST_TARGET) $(SPECTRUM_TEST_TARGET)
+	$(MAKE) CFLAGS="$(CFLAGS) -Wall -Wextra -Wpedantic -Werror" all $(ANALOG_TEST_TARGET) $(SPECTRUM_TEST_TARGET) $(RECORDING_TEST_TARGET)
 
 $(ANALOG_TEST_TARGET): tests/analog_frontend_test.c demod/analog_frontend.c demod/header/analog_frontend.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/analog_frontend_test.c demod/analog_frontend.c \
@@ -31,9 +32,14 @@ $(SPECTRUM_TEST_TARGET): tests/spectrum_test.c utility/spectrum.c utility/spectr
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/spectrum_test.c utility/spectrum.c \
 		-o $@ $(LDFLAGS) -lliquid -lm
 
-test: $(TARGET) $(ANALOG_TEST_TARGET) $(SPECTRUM_TEST_TARGET)
+$(RECORDING_TEST_TARGET): tests/recording_test.c utility/recording.c utility/recording.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/recording_test.c utility/recording.c \
+		-o $@ $(LDFLAGS) -lm
+
+test: $(TARGET) $(ANALOG_TEST_TARGET) $(SPECTRUM_TEST_TARGET) $(RECORDING_TEST_TARGET)
 	./$(ANALOG_TEST_TARGET)
 	./$(SPECTRUM_TEST_TARGET)
+	./$(RECORDING_TEST_TARGET)
 	./$(TARGET) --mode adsb --adsb-test --output log
 	./$(TARGET) --mode ais --ais-test --output log
 	./$(TARGET) --mode sonde --test --output log

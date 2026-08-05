@@ -29,6 +29,7 @@
 #include "demod/header/demodulator.h"
 #include "utility/dashboard.h"
 #include "utility/output.h"
+#include "utility/recording.h"
 #include "utility/spectrum.h"
 
 static volatile int g_stop = 0;
@@ -36,8 +37,15 @@ static _Atomic(rtlsdr_dev_t *) g_dev = NULL;
 static pthread_mutex_t g_dev_lock = PTHREAD_MUTEX_INITIALIZER;
 static _Atomic uint32_t g_current_frequency_hz = 0u;
 static _Atomic int g_input_sample_rate = 0;
+static _Atomic int g_manual_gain_enabled = 0;
+static _Atomic int g_requested_gain_db = 0;
 static demodulator_t g_demod;
 static spectrum_analyzer_t *g_spectrum = NULL;
+static recording_writer_t g_iq_recorder;
+
+static void cleanup_iq_recorder(void) {
+    recording_writer_destroy(&g_iq_recorder);
+}
 
 typedef struct {
     int fd;
@@ -250,6 +258,7 @@ static int parse_analog_filter_type(const char *name, analog_filter_type_t *type
 static void rtlsdr_cb(unsigned char *buf, uint32_t len, void *ctx) {
     live_stats_t *stats = (live_stats_t *)ctx;
     if (g_stop) return;
+    recording_writer_write_iq_u8(&g_iq_recorder, buf, len);
     if (g_spectrum) spectrum_analyzer_feed_u8(g_spectrum, buf, len);
     if (stats) {
         for (uint32_t p = 0; p + 1u < len; p += 2u) {
@@ -422,10 +431,14 @@ static void usage(const char *prog) {
     fprintf(stderr, "  --stats <sec>       receiver status interval; 0 disables (default: 5)\n");
     fprintf(stderr, "  --spectrum          emit live FFT frames for a GUI\n");
     fprintf(stderr, "  --spectrum-fd <n>   file descriptor for spectrum JSON (default: stdout)\n");
-    fprintf(stderr, "  --control-fd <n>    read live TUNE/CHANNEL/FILTER/SQUELCH commands from this descriptor\n");
+    fprintf(stderr, "  --control-fd <n>    read live tuning/filter/recording commands from this descriptor\n");
     fprintf(stderr, "  --fft-size <n>      FFT bins: 256|512|1024|2048|4096 (default: 1024)\n");
     fprintf(stderr, "  --spectrum-fps <n>  spectrum refresh rate, 1..60 (default: 30)\n");
     fprintf(stderr, "  --demod <fm|am>     voice demodulator (default: fm)\n");
+    fprintf(stderr, "  --record-audio <p>  record demodulated Voice audio to this path\n");
+    fprintf(stderr, "  --audio-format <f>  wav-s16|wav-f32|s16le|f32le (default: wav-s16)\n");
+    fprintf(stderr, "  --record-iq <path>  record raw interleaved I/Q samples\n");
+    fprintf(stderr, "  --iq-format <f>     cu8|cs16le|cf32le|wav-iq-s16|sigmf-cu8 (default: cu8)\n");
     fprintf(stderr, "  --lat/--lon <deg>   receiver reference for ADS-B local/surface CPR\n");
     fprintf(stderr, "  --output <format>   dashboard(default)|log|json|csv|avr|beast|quiet\n");
     fprintf(stderr, "  --input <file|->    decode protocol data or replay an IQ recording\n");
@@ -470,15 +483,124 @@ static int parse_double_arg(const char *s, double *out) {
     return 1;
 }
 
+static const char *recording_command_path(const char *arguments,
+                                          char *format,
+                                          size_t format_size) {
+    int consumed = 0;
+    if (!arguments || !format || format_size < 2u) return NULL;
+    while (*arguments == ' ' || *arguments == '\t') arguments++;
+    if (sscanf(arguments, "%31s %n", format, &consumed) != 1
+        || consumed <= 0 || format_size < 32u) {
+        return NULL;
+    }
+    arguments += consumed;
+    while (*arguments == ' ' || *arguments == '\t') arguments++;
+    return *arguments ? arguments : NULL;
+}
+
+static int apply_tuner_gain(rtlsdr_dev_t *dev, int manual_gain,
+                            int gain_db, int runtime_event) {
+    const char *source = runtime_event ? "CONTROL" : "RX";
+    const char *mode = manual_gain ? "manual" : "auto";
+    int result;
+
+    if (!dev) return 0;
+    result = rtlsdr_set_tuner_gain_mode(dev, manual_gain ? 1 : 0);
+    if (result < 0) {
+        fprintf(stderr,
+                "[%s] event=gain-failed mode=%s stage=mode error=%d\n",
+                source, mode, result);
+        return 0;
+    }
+    if (!manual_gain) {
+        fprintf(stderr, "[%s] event=gain mode=auto\n", source);
+        return 1;
+    }
+
+    result = rtlsdr_set_tuner_gain(dev, gain_db * 10);
+    if (result < 0) {
+        fprintf(stderr,
+                "[%s] event=gain-failed mode=manual stage=value error=%d\n",
+                source, result);
+        return 0;
+    }
+    fprintf(stderr,
+            "[%s] event=gain mode=manual requested_db=%d applied_db=%.1f\n",
+            source, gain_db, rtlsdr_get_tuner_gain(dev) / 10.0);
+    return 1;
+}
+
+static void report_recording_started(const char *kind,
+                                     recording_writer_t *writer,
+                                     recording_format_t format) {
+    char path[RECORDING_PATH_MAX];
+    if (!recording_writer_get_path(writer, path, sizeof(path))) {
+        (void)snprintf(path, sizeof(path), "unknown");
+    }
+    fprintf(stderr,
+            "[CONTROL] event=record-started kind=%s format=%s path=%s\n",
+            kind, recording_format_name(format), path);
+}
+
+static void report_recording_stopped(const char *kind,
+                                     uint64_t bytes,
+                                     int write_failed) {
+    fprintf(stderr,
+            "[CONTROL] event=record-stopped kind=%s bytes=%llu status=%s\n",
+            kind, (unsigned long long)bytes,
+            write_failed ? "write-error" : "ok");
+}
+
 static void runtime_control_handle_line(const char *line) {
     unsigned long requested_frequency = 0ul;
     unsigned long channel_frequency = 0ul;
     int filter_width_hz = 0;
     int filter_type = 0;
     int squelch_enabled = 0;
+    int gain_db = 0;
     double squelch_threshold = 0.0;
+    char recording_format[32];
+    recording_format_t parsed_recording_format;
 
     if (!line) return;
+    if (strcmp(line, "GAIN AUTO") == 0
+        || sscanf(line, "GAIN MANUAL %d", &gain_db) == 1) {
+        rtlsdr_dev_t *dev;
+        int manual_gain = strcmp(line, "GAIN AUTO") != 0;
+        if (manual_gain && (gain_db < 0 || gain_db > 50)) {
+            fprintf(stderr,
+                    "[CONTROL] event=gain-failed mode=manual reason=invalid-gain\n");
+            return;
+        }
+        (void)pthread_mutex_lock(&g_dev_lock);
+        dev = atomic_load_explicit(&g_dev, memory_order_acquire);
+        if (!dev) {
+            atomic_store_explicit(&g_manual_gain_enabled, manual_gain,
+                                  memory_order_release);
+            if (manual_gain) {
+                atomic_store_explicit(&g_requested_gain_db, gain_db,
+                                      memory_order_release);
+            } else {
+                gain_db = atomic_load_explicit(&g_requested_gain_db,
+                                               memory_order_relaxed);
+            }
+            (void)pthread_mutex_unlock(&g_dev_lock);
+            fprintf(stderr,
+                    "[CONTROL] event=gain-pending mode=%s requested_db=%d reason=receiver-not-ready\n",
+                    manual_gain ? "manual" : "auto", gain_db);
+            return;
+        }
+        if (apply_tuner_gain(dev, manual_gain, gain_db, 1)) {
+            atomic_store_explicit(&g_manual_gain_enabled, manual_gain,
+                                  memory_order_release);
+            if (manual_gain) {
+                atomic_store_explicit(&g_requested_gain_db, gain_db,
+                                      memory_order_release);
+            }
+        }
+        (void)pthread_mutex_unlock(&g_dev_lock);
+        return;
+    }
     if (sscanf(line, "TUNE %lu", &requested_frequency) == 1) {
         rtlsdr_dev_t *dev;
         int result;
@@ -503,11 +625,66 @@ static void runtime_control_handle_line(const char *line) {
         atomic_store_explicit(&g_current_frequency_hz,
                               (uint32_t)requested_frequency,
                               memory_order_release);
+        recording_writer_note_frequency(&g_iq_recorder,
+                                        (uint32_t)requested_frequency);
         (void)demodulator_set_frequency_offset(&g_demod, 0.0f);
         spectrum_analyzer_set_center_frequency(
             g_spectrum, (uint32_t)requested_frequency);
         fprintf(stderr, "[CONTROL] event=tuned frequency_hz=%lu\n",
                 requested_frequency);
+        return;
+    }
+    if (strncmp(line, "RECORD_AUDIO START ", 19u) == 0) {
+        const char *path = recording_command_path(
+            line + 19u, recording_format, sizeof(recording_format));
+        if (!path
+            || !recording_parse_audio_format(recording_format,
+                                             &parsed_recording_format)
+            || voice_module_recording_active(&g_voice)
+            || !voice_module_start_recording(&g_voice, path,
+                                              parsed_recording_format)) {
+            fprintf(stderr,
+                    "[CONTROL] event=record-failed kind=audio reason=start\n");
+            return;
+        }
+        report_recording_started("audio", &g_voice.audio_recorder,
+                                 parsed_recording_format);
+        return;
+    }
+    if (strcmp(line, "RECORD_AUDIO STOP") == 0) {
+        int write_failed = 0;
+        uint64_t bytes = voice_module_stop_recording(&g_voice,
+                                                     &write_failed);
+        report_recording_stopped("audio", bytes, write_failed);
+        return;
+    }
+    if (strncmp(line, "RECORD_IQ START ", 16u) == 0) {
+        const char *path = recording_command_path(
+            line + 16u, recording_format, sizeof(recording_format));
+        int sample_rate = atomic_load_explicit(
+            &g_input_sample_rate, memory_order_relaxed);
+        uint32_t center_frequency = atomic_load_explicit(
+            &g_current_frequency_hz, memory_order_relaxed);
+        if (!path
+            || !recording_parse_iq_format(recording_format,
+                                          &parsed_recording_format)
+            || recording_writer_is_active(&g_iq_recorder)
+            || !recording_writer_start_iq(&g_iq_recorder, path,
+                                          parsed_recording_format,
+                                          sample_rate, center_frequency)) {
+            fprintf(stderr,
+                    "[CONTROL] event=record-failed kind=iq reason=start\n");
+            return;
+        }
+        report_recording_started("iq", &g_iq_recorder,
+                                 parsed_recording_format);
+        return;
+    }
+    if (strcmp(line, "RECORD_IQ STOP") == 0) {
+        int write_failed = 0;
+        uint64_t bytes = recording_writer_stop(&g_iq_recorder,
+                                               &write_failed);
+        report_recording_stopped("iq", bytes, write_failed);
         return;
     }
     if (sscanf(line, "CHANNEL %lu", &channel_frequency) == 1) {
@@ -563,8 +740,8 @@ static void runtime_control_handle_line(const char *line) {
 
 static void *runtime_control_worker(void *user) {
     runtime_control_t *control = (runtime_control_t *)user;
-    char input[512];
-    char line[256];
+    char input[1024];
+    char line[RECORDING_PATH_MAX + 128u];
     size_t line_length = 0u;
 
     if (!control) return NULL;
@@ -806,14 +983,7 @@ static int open_configured_rtlsdr(rtlsdr_dev_t **out, const char *selector,
         rtlsdr_close(dev);
         return 0;
     }
-    if (use_manual_gain) {
-        (void)rtlsdr_set_tuner_gain_mode(dev, 1);
-        if ((r = rtlsdr_set_tuner_gain(dev, gain * 10)) < 0) {
-            fprintf(stderr, "Warning: tuner gain failed (%d)\n", r);
-        }
-    } else {
-        (void)rtlsdr_set_tuner_gain_mode(dev, 0);
-    }
+    (void)apply_tuner_gain(dev, use_manual_gain, gain, 0);
     if ((r = rtlsdr_reset_buffer(dev)) < 0) {
         fprintf(stderr, "Warning: RTL-SDR buffer reset failed (%d)\n", r);
     }
@@ -831,6 +1001,8 @@ int main(int argc, char **argv) {
     sstv_module_reset(&g_sstv);
     meteor_module_reset(&g_meteor);
     adsb_protocol_reset();
+    recording_writer_init(&g_iq_recorder);
+    (void)atexit(cleanup_iq_recorder);
 
     if (argc < 2) {
         usage(argv[0]);
@@ -862,6 +1034,12 @@ int main(int argc, char **argv) {
     int squelch_enabled = 0;
     int squelch_explicit = 0;
     const char *voice_demod = NULL;
+    const char *record_audio_path = NULL;
+    const char *audio_format_name = "wav-s16";
+    const char *record_iq_path = NULL;
+    const char *iq_format_name = "cu8";
+    int audio_format_explicit = 0;
+    int iq_format_explicit = 0;
     const char *adsb_frame = NULL;
     const char *sonde_frame = NULL;
     const char *sstv_mode = NULL;
@@ -969,6 +1147,40 @@ int main(int argc, char **argv) {
                 return 1;
             }
             output_format_explicit = 1;
+            continue;
+        }
+        if (strcmp(arg, "--record-audio") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Missing value for --record-audio\n");
+                return 1;
+            }
+            record_audio_path = argv[++i];
+            continue;
+        }
+        if (strcmp(arg, "--audio-format") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Missing value for --audio-format\n");
+                return 1;
+            }
+            audio_format_name = argv[++i];
+            audio_format_explicit = 1;
+            continue;
+        }
+        if (strcmp(arg, "--record-iq") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Missing value for --record-iq\n");
+                return 1;
+            }
+            record_iq_path = argv[++i];
+            continue;
+        }
+        if (strcmp(arg, "--iq-format") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Missing value for --iq-format\n");
+                return 1;
+            }
+            iq_format_name = argv[++i];
+            iq_format_explicit = 1;
             continue;
         }
         if (strcmp(arg, "--input") == 0) {
@@ -1281,6 +1493,39 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    recording_format_t audio_recording_format = RECORDING_FORMAT_NONE;
+    recording_format_t iq_recording_format = RECORDING_FORMAT_NONE;
+    if (audio_format_explicit && !record_audio_path) {
+        fprintf(stderr, "--audio-format requires --record-audio\n");
+        return 1;
+    }
+    if (iq_format_explicit && !record_iq_path) {
+        fprintf(stderr, "--iq-format requires --record-iq\n");
+        return 1;
+    }
+    if (record_audio_path
+        && (!streq_icase(module->name, "voice")
+            || !recording_parse_audio_format(audio_format_name,
+                                             &audio_recording_format))) {
+        fprintf(stderr,
+                "Audio recording requires mode=voice and format wav-s16|wav-f32|s16le|f32le\n");
+        return 1;
+    }
+    if (record_iq_path
+        && (!recording_parse_iq_format(iq_format_name,
+                                       &iq_recording_format)
+            || streq_icase(module->name, "meteor"))) {
+        fprintf(stderr,
+                "IQ recording format must be cu8|cs16le|cf32le|wav-iq-s16|sigmf-cu8 and is unavailable for Meteor\n");
+        return 1;
+    }
+    if ((record_audio_path || record_iq_path)
+        && (input_path || ais_test || adsb_test || generic_test
+            || ais_payload || ais_nmea || adsb_frame || sonde_frame)) {
+        fprintf(stderr, "Recording options are available only for live RTL-SDR sessions\n");
+        return 1;
+    }
+
     if (sample_rate_override > 0 && !streq_icase(module->name, "voice")) {
         fprintf(stderr, "--sample-rate currently applies only to mode=voice\n");
         return 1;
@@ -1585,6 +1830,10 @@ int main(int argc, char **argv) {
                           memory_order_relaxed);
     atomic_store_explicit(&g_input_sample_rate, demod_cfg.input_fs,
                           memory_order_relaxed);
+    atomic_store_explicit(&g_manual_gain_enabled, use_manual_gain,
+                          memory_order_relaxed);
+    atomic_store_explicit(&g_requested_gain_db, gain,
+                          memory_order_relaxed);
 
     FILE *spectrum_output = NULL;
     int close_spectrum_output = 0;
@@ -1615,6 +1864,34 @@ int main(int argc, char **argv) {
 
     if (!runtime_control_start(control_fd)) {
         fprintf(stderr, "Cannot initialize runtime control channel\n");
+        spectrum_analyzer_destroy(g_spectrum);
+        g_spectrum = NULL;
+        if (close_spectrum_output) fclose(spectrum_output);
+        demodulator_flush(&g_demod);
+        module->flush(module->ctx);
+        return 1;
+    }
+
+    if (record_audio_path
+        && !voice_module_start_recording(&g_voice, record_audio_path,
+                                         audio_recording_format)) {
+        fprintf(stderr, "Cannot start audio recording at %s\n",
+                record_audio_path);
+        runtime_control_stop();
+        spectrum_analyzer_destroy(g_spectrum);
+        g_spectrum = NULL;
+        if (close_spectrum_output) fclose(spectrum_output);
+        demodulator_flush(&g_demod);
+        module->flush(module->ctx);
+        return 1;
+    }
+    if (record_iq_path
+        && !recording_writer_start_iq(&g_iq_recorder, record_iq_path,
+                                      iq_recording_format,
+                                      demod_cfg.input_fs, freq_hz)) {
+        fprintf(stderr, "Cannot start IQ recording at %s\n", record_iq_path);
+        (void)voice_module_stop_recording(&g_voice, NULL);
+        runtime_control_stop();
         spectrum_analyzer_destroy(g_spectrum);
         g_spectrum = NULL;
         if (close_spectrum_output) fclose(spectrum_output);
@@ -1660,10 +1937,15 @@ int main(int argc, char **argv) {
         rtlsdr_dev_t *dev = NULL;
         uint32_t requested_frequency = atomic_load_explicit(
             &g_current_frequency_hz, memory_order_acquire);
+        int requested_manual_gain = atomic_load_explicit(
+            &g_manual_gain_enabled, memory_order_acquire);
+        int requested_gain_db = atomic_load_explicit(
+            &g_requested_gain_db, memory_order_acquire);
         int r;
         if (!open_configured_rtlsdr(&dev, device_selector, &demod_cfg,
                                     requested_frequency,
-                                    have_ppm, ppm, tuner_bw, use_manual_gain, gain)) {
+                                    have_ppm, ppm, tuner_bw,
+                                    requested_manual_gain, requested_gain_db)) {
             final_read_result = -1;
             if (output_is_dashboard()) dashboard_set_connection("device non trovato");
         } else {
@@ -1697,6 +1979,7 @@ int main(int argc, char **argv) {
     }
 
     runtime_control_stop();
+    (void)recording_writer_stop(&g_iq_recorder, NULL);
     spectrum_analyzer_destroy(g_spectrum);
     g_spectrum = NULL;
     if (close_spectrum_output) fclose(spectrum_output);

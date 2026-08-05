@@ -59,6 +59,19 @@
             </div>
             <input id="frequency-input" type="hidden" value="145.500" />
           </div>
+          <div class="channel-readout">
+            <span>Frequenza sintonizzata</span>
+            <div class="channel-frequency-row">
+              <output id="channel-frequency-output" aria-label="Frequenza effettiva del canale selezionato">145.500000 MHz</output>
+              <button id="copy-channel-frequency" class="copy-frequency-button" type="button" aria-label="Copia frequenza sintonizzata in hertz" title="Copia frequenza in Hz">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <rect x="9" y="9" width="10" height="10" rx="2"></rect>
+                  <path d="M15 9V7a2 2 0 0 0-2-2H7a2 2 0 0 0-2 2v6a2 2 0 0 0 2 2h2"></path>
+                </svg>
+                <span>Hz</span>
+              </button>
+            </div>
+          </div>
           <div class="span-readout">
             <span>Span istantaneo</span>
             <strong id="span-label">2.400 MHz</strong>
@@ -110,7 +123,7 @@
             </div>
 
             <div id="live-visual" class="canvas-stack">
-              <div class="canvas-label"><span>Spettro</span><span>Clic/drag: seleziona il canale · centro fisso</span></div>
+              <div class="canvas-label"><span>Spettro</span><span>Clic/drag: seleziona · rotella: ±1 kHz · centro fisso</span></div>
               <canvas id="spectrum-canvas" aria-label="Spettro radio live"></canvas>
               <div id="filter-passband" class="filter-passband hidden" aria-label="Larghezza del filtro Voice">
                 <button id="filter-handle-left" class="filter-handle filter-handle-left" type="button" aria-label="Ridimensiona il filtro dal lato sinistro"></button>
@@ -197,6 +210,62 @@
 
           <div id="protocol-section-rule" class="section-rule"></div>
           <div id="protocol-controls" class="control-section"></div>
+
+          <div class="section-rule live-only-control"></div>
+          <div id="recording-controls" class="control-section live-only-control">
+            <div class="section-title"><span>Registrazione</span><small>Avvio a caldo</small></div>
+
+            <div id="audio-recording-block" class="recording-block">
+              <div class="recording-heading">
+                <span><b>Audio demodulato</b><small>Voice · 48 kHz mono</small></span>
+                <output id="audio-recording-status">Fermo</output>
+              </div>
+              <label class="field">
+                <span>Formato audio</span>
+                <select id="audio-recording-format">
+                  <option value="wav-s16" selected>WAV PCM 16-bit — consigliato</option>
+                  <option value="wav-f32">WAV Float 32-bit</option>
+                  <option value="s16le">PCM raw S16 LE</option>
+                  <option value="f32le">PCM raw F32 LE</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>Percorso file</span>
+                <input id="audio-recording-path" type="text" placeholder="Automatico in registrazioni/" />
+              </label>
+              <button id="audio-recording-button" class="recording-button" type="button" disabled>
+                <i></i><span>Registra audio</span>
+              </button>
+            </div>
+
+            <div class="recording-block">
+              <div class="recording-heading">
+                <span><b>Segnale I/Q raw</b><small>Prima di filtro e demodulazione</small></span>
+                <output id="iq-recording-status">Fermo</output>
+              </div>
+              <label class="field">
+                <span>Formato I/Q</span>
+                <select id="iq-recording-format">
+                  <option value="cu8" selected>CU8 — nativo RTL-SDR</option>
+                  <option value="cs16le">CS16 LE — compatibilità SDR</option>
+                  <option value="cf32le">CF32 LE — elaborazione DSP</option>
+                  <option value="wav-iq-s16">WAV I/Q PCM16 stereo</option>
+                  <option value="sigmf-cu8">SigMF CU8 + metadati</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>Percorso file</span>
+                <input id="iq-recording-path" type="text" placeholder="Automatico in registrazioni/" />
+              </label>
+              <button id="iq-recording-button" class="recording-button" type="button" disabled>
+                <i></i><span>Registra I/Q</span>
+              </button>
+              <details class="format-guide">
+                <summary>Quale formato raw scegliere?</summary>
+                <p><b>CU8</b> è compatto e conserva i byte originali RTL-SDR. <b>CS16</b> è molto interoperabile, <b>CF32</b> è comodo per DSP, <b>WAV I/Q</b> usa due canali PCM ed è limitato a 4 GB. <b>SigMF</b> aggiunge sample-rate, frequenza e cambi di sintonia.</p>
+              </details>
+            </div>
+          </div>
 
           <div class="section-rule live-only-control"></div>
           <div class="control-section live-only-control">

@@ -11,6 +11,8 @@ const elements = {
   frequency: $('#frequency-input'),
   frequencyEditor: $('#frequency-editor'),
   frequencyDigits: $('#frequency-digits'),
+  channelFrequency: $('#channel-frequency-output'),
+  copyChannelFrequency: $('#copy-channel-frequency'),
   span: $('#span-label'),
   start: $('#start-button'),
   startLabel: $('#start-button-label'),
@@ -45,6 +47,16 @@ const elements = {
   ppm: $('#ppm-input'),
   tunerBandwidth: $('#tuner-bandwidth'),
   protocolControls: $('#protocol-controls'),
+  recordingControls: $('#recording-controls'),
+  audioRecordingBlock: $('#audio-recording-block'),
+  audioRecordingFormat: $('#audio-recording-format'),
+  audioRecordingPath: $('#audio-recording-path'),
+  audioRecordingButton: $('#audio-recording-button'),
+  audioRecordingStatus: $('#audio-recording-status'),
+  iqRecordingFormat: $('#iq-recording-format'),
+  iqRecordingPath: $('#iq-recording-path'),
+  iqRecordingButton: $('#iq-recording-button'),
+  iqRecordingStatus: $('#iq-recording-status'),
   fftSize: $('#fft-size-select'),
   fpsInput: $('#fps-input'),
   fpsOutput: $('#fps-output'),
@@ -76,6 +88,12 @@ const state = {
   measuredFps: 0,
   lastFpsAt: performance.now(),
   receiverStatus: { channelDbfs: null, thresholdDbfs: null, squelchOpen: null },
+  recordings: {
+    audio: { active: false, path: '', format: '', bytes: 0 },
+    iq: { active: false, path: '', format: '', bytes: 0 },
+  },
+  recordingPending: { audio: false, iq: false },
+  appliedGainDb: null,
   liveTune: { dragging: false, rect: null, frequencyHz: null },
   filterResize: { dragging: false, rect: null },
   logs: [],
@@ -109,7 +127,30 @@ const FREQUENCY_DIGIT_LABELS = [
   'centinaia di kilohertz', 'decine di kilohertz', 'kilohertz',
   'centinaia di hertz', 'decine di hertz', 'hertz',
 ];
+const LIVE_PLOT_INSETS = Object.freeze({ left: 48, right: 15 });
+const CHANNEL_WHEEL_STEP_HZ = 1_000;
 let frequencyRetuneTimer = null;
+let gainUpdateTimer = null;
+let channelWheelCommitTimer = null;
+let channelWheelFeedbackTimer = null;
+
+function livePlotMetrics(totalWidth) {
+  const width = Math.max(1, Number(totalWidth) || 1);
+  const left = Math.min(LIVE_PLOT_INSETS.left, Math.max(0, width - 1));
+  const right = Math.min(LIVE_PLOT_INSETS.right, Math.max(0, width - left - 1));
+  return { left, right, width: Math.max(1, width - left - right) };
+}
+
+function livePlotX(ratio, totalWidth) {
+  const plot = livePlotMetrics(totalWidth);
+  return plot.left + Math.max(0, Math.min(1, ratio)) * plot.width;
+}
+
+function livePlotRatio(clientX, rect) {
+  const plot = livePlotMetrics(rect.width);
+  return Math.max(0, Math.min(1,
+    (clientX - rect.left - plot.left) / plot.width));
+}
 
 function clampFrequencyHz(frequencyHz) {
   return Math.max(0, Math.min(FREQUENCY_MAX_HZ, Math.round(Number(frequencyHz) || 0)));
@@ -193,6 +234,43 @@ function formatFrequency(hz, digits = 3) {
   if (Math.abs(hz) >= 1e6) return `${(hz / 1e6).toFixed(digits)} MHz`;
   if (Math.abs(hz) >= 1e3) return `${(hz / 1e3).toFixed(1)} kHz`;
   return `${hz.toFixed(0)} Hz`;
+}
+
+function formatChannelFrequency(hz) {
+  return Number.isFinite(hz) ? `${(hz / 1e6).toFixed(6)} MHz` : '—';
+}
+
+function updateChannelFrequencyReadout(frequencyHz = state.channelHz) {
+  elements.channelFrequency.textContent = formatChannelFrequency(frequencyHz);
+  const isValid = Number.isFinite(frequencyHz);
+  elements.copyChannelFrequency.disabled = !isValid;
+  elements.copyChannelFrequency.title = isValid
+    ? `Copia ${Math.round(frequencyHz)} Hz`
+    : 'Frequenza non disponibile';
+}
+
+async function copyChannelFrequencyHz() {
+  if (!Number.isFinite(state.channelHz)) return;
+  const frequencyHz = String(Math.round(state.channelHz));
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(frequencyHz);
+    } else {
+      const fallback = document.createElement('textarea');
+      fallback.value = frequencyHz;
+      fallback.setAttribute('readonly', '');
+      fallback.style.position = 'fixed';
+      fallback.style.opacity = '0';
+      document.body.appendChild(fallback);
+      fallback.select();
+      const copied = document.execCommand('copy');
+      fallback.remove();
+      if (!copied) throw new Error('Copia non supportata');
+    }
+    toast(`Copiata: ${frequencyHz} Hz`);
+  } catch (error) {
+    toast(`Impossibile copiare la frequenza: ${error.message}`, 'error');
+  }
 }
 
 function formatValue(value, suffix = '', digits = 1) {
@@ -286,14 +364,26 @@ const waterfall = {
 
   draw() {
     const { context, width, height } = fitCanvas(elements.waterfallCanvas);
+    const plot = livePlotMetrics(width);
     context.clearRect(0, 0, width, height);
-    if (this.width > 0) context.drawImage(this.canvas, 0, 0, width, height);
-    else {
+    context.fillStyle = '#090c13';
+    context.fillRect(0, 0, width, height);
+    if (this.width > 1) {
+      // Crop from the centre of the first bin to the centre of the last one,
+      // matching the bin-to-pixel mapping used by the spectrum trace.
+      context.drawImage(
+        this.canvas,
+        0.5, 0, this.width - 1, this.height,
+        plot.left, 0, plot.width, height,
+      );
+    } else if (this.width === 1) {
+      context.drawImage(this.canvas, plot.left, 0, plot.width, height);
+    } else {
       const gradient = context.createLinearGradient(0, 0, 0, height);
       gradient.addColorStop(0, '#0d1220');
       gradient.addColorStop(1, '#07090f');
       context.fillStyle = gradient;
-      context.fillRect(0, 0, width, height);
+      context.fillRect(plot.left, 0, plot.width, height);
     }
   },
 };
@@ -301,11 +391,9 @@ const waterfall = {
 function drawSpectrum() {
   const { context, width, height } = fitCanvas(elements.spectrumCanvas);
   const bins = state.latestBins;
-  const left = 48;
-  const right = 15;
+  const { left, right, width: graphWidth } = livePlotMetrics(width);
   const top = 10;
   const bottom = 27;
-  const graphWidth = Math.max(1, width - left - right);
   const graphHeight = Math.max(1, height - top - bottom);
   const minimumDb = -120;
   const maximumDb = 0;
@@ -531,6 +619,89 @@ function updateProtocolControls() {
   renderDecoder();
   updateSpanLabel();
   updateFilterBand();
+  renderRecordingControls();
+}
+
+function formatRecordingBytes(bytes) {
+  const value = Number(bytes) || 0;
+  if (value >= 1e9) return `${(value / 1e9).toFixed(2)} GB`;
+  if (value >= 1e6) return `${(value / 1e6).toFixed(1)} MB`;
+  if (value >= 1e3) return `${(value / 1e3).toFixed(1)} kB`;
+  return `${value} B`;
+}
+
+function renderRecordingControls() {
+  if (!elements.recordingControls) return;
+  const sessionReady = state.mode === 'live'
+    && state.processMode === 'live'
+    && ['starting', 'receiving'].includes(state.processStatus);
+  elements.audioRecordingBlock.classList.toggle(
+    'hidden', elements.protocol.value !== 'voice');
+
+  for (const kind of ['audio', 'iq']) {
+    const recording = state.recordings[kind];
+    const pending = state.recordingPending[kind];
+    const button = kind === 'audio'
+      ? elements.audioRecordingButton : elements.iqRecordingButton;
+    const status = kind === 'audio'
+      ? elements.audioRecordingStatus : elements.iqRecordingStatus;
+    const format = kind === 'audio'
+      ? elements.audioRecordingFormat : elements.iqRecordingFormat;
+    const path = kind === 'audio'
+      ? elements.audioRecordingPath : elements.iqRecordingPath;
+    const available = sessionReady
+      && (kind !== 'audio' || elements.protocol.value === 'voice');
+    const busy = pending || Boolean(recording.stopping);
+    button.disabled = !available || busy;
+    button.classList.toggle('active', Boolean(recording.active));
+    button.querySelector('span').textContent = recording.active
+      ? `Ferma registrazione ${kind === 'audio' ? 'audio' : 'I/Q'}`
+      : `Registra ${kind === 'audio' ? 'audio' : 'I/Q'}`;
+    format.disabled = Boolean(recording.active) || busy;
+    path.disabled = Boolean(recording.active) || busy;
+    if (recording.path && (recording.active || recording.stopping)) {
+      path.value = recording.path;
+    }
+    status.classList.toggle('active', Boolean(recording.active));
+    if (recording.active) status.textContent = '● REC';
+    else if (recording.stopping) status.textContent = 'Salvataggio…';
+    else if (recording.error) status.textContent = 'Errore';
+    else if (recording.path && recording.bytes > 0) {
+      status.textContent = `Salvato · ${formatRecordingBytes(recording.bytes)}`;
+    } else status.textContent = 'Fermo';
+    status.title = recording.error || recording.path || '';
+  }
+}
+
+async function toggleRecording(kind) {
+  const recording = state.recordings[kind];
+  const format = kind === 'audio'
+    ? elements.audioRecordingFormat : elements.iqRecordingFormat;
+  const path = kind === 'audio'
+    ? elements.audioRecordingPath : elements.iqRecordingPath;
+  const action = recording.active ? 'stop' : 'start';
+  state.recordingPending[kind] = true;
+  renderRecordingControls();
+  try {
+    const result = await api('/api/live/recording', {
+      method: 'POST',
+      body: JSON.stringify({
+        kind,
+        action,
+        format: format.value,
+        path: path.value,
+      }),
+    });
+    if (result.path) path.value = result.path;
+    toast(action === 'start'
+      ? `Registrazione ${kind === 'audio' ? 'audio' : 'I/Q'} avviata`
+      : `Registrazione ${kind === 'audio' ? 'audio' : 'I/Q'} salvata`);
+  } catch (error) {
+    toast(error.message, 'error');
+  } finally {
+    state.recordingPending[kind] = false;
+    renderRecordingControls();
+  }
 }
 
 function updateSpanLabel() {
@@ -539,6 +710,45 @@ function updateSpanLabel() {
   const sampleRate = protocol === 'voice' ? Number($('#voice-sample-rate')?.value || 2_400_000) : rates[protocol];
   elements.span.textContent = formatFrequency(sampleRate, sampleRate >= 1e6 ? 3 : 0);
   updateFilterBand();
+}
+
+function renderGainOutput() {
+  if (elements.gainAuto.checked) {
+    elements.gainOutput.textContent = 'Auto';
+    elements.gainOutput.title = 'Controllo automatico del tuner';
+    return;
+  }
+  const requestedGainDb = Number(elements.gainInput.value);
+  if (Number.isFinite(state.appliedGainDb)) {
+    elements.gainOutput.textContent = `${requestedGainDb} dB · eff. ${state.appliedGainDb.toFixed(1)} dB`;
+    elements.gainOutput.title = `Gain richiesto: ${requestedGainDb} dB; applicato dal tuner: ${state.appliedGainDb.toFixed(1)} dB`;
+  } else {
+    elements.gainOutput.textContent = `${requestedGainDb} dB`;
+    elements.gainOutput.title = 'Gain manuale richiesto';
+  }
+}
+
+async function updateRuntimeGain() {
+  clearTimeout(gainUpdateTimer);
+  renderGainOutput();
+  if (state.processMode !== 'live'
+      || !['starting', 'receiving'].includes(state.processStatus)) return;
+  try {
+    await api('/api/live/gain', {
+      method: 'POST',
+      body: JSON.stringify({
+        manualGain: !elements.gainAuto.checked,
+        gainDb: Number(elements.gainInput.value),
+      }),
+    });
+  } catch (error) {
+    toast(error.message, 'error');
+  }
+}
+
+function scheduleRuntimeGain() {
+  clearTimeout(gainUpdateTimer);
+  gainUpdateTimer = setTimeout(() => { void updateRuntimeGain(); }, 120);
 }
 
 function selectedVoiceSampleRate() {
@@ -587,9 +797,11 @@ function updateFilterBand(channelOverrideHz) {
     ? Math.max(0, Math.min(1, 0.5 + (channelHz - state.centerHz) / sampleRate))
     : 0.5;
   const widthHz = normalizeFilterWidth(input.value);
-  const widthPercent = sampleRate > 0 ? widthHz / sampleRate * 100 : 0;
-  elements.filterPassband.style.left = `${ratio * 100 - widthPercent / 2}%`;
-  elements.filterPassband.style.width = `${widthPercent}%`;
+  const plot = livePlotMetrics(elements.liveVisual.getBoundingClientRect().width);
+  const centerX = plot.left + ratio * plot.width;
+  const widthPx = sampleRate > 0 ? widthHz / sampleRate * plot.width : 0;
+  elements.filterPassband.style.left = `${centerX - widthPx / 2}px`;
+  elements.filterPassband.style.width = `${widthPx}px`;
   elements.filterPassbandLabel.textContent = formatFilterWidth(widthHz);
   $('#voice-filter-width-output').textContent = formatFilterWidth(widthHz);
 }
@@ -621,9 +833,10 @@ function previewFilterResize(clientX) {
   const ratio = sampleRate > 0
     ? Math.max(0, Math.min(1, 0.5 + (channelHz - state.centerHz) / sampleRate))
     : 0.5;
-  const centerX = resize.rect.left + ratio * resize.rect.width;
+  const plot = livePlotMetrics(resize.rect.width);
+  const centerX = resize.rect.left + plot.left + ratio * plot.width;
   const halfWidthPx = Math.abs(clientX - centerX);
-  setVoiceFilterWidth(2 * halfWidthPx / resize.rect.width * sampleRate);
+  setVoiceFilterWidth(2 * halfWidthPx / plot.width * sampleRate);
 }
 
 function beginFilterResize(event) {
@@ -755,6 +968,7 @@ function setMode(mode) {
     scheduleScanDraw();
   }
   updateFilterBand();
+  renderRecordingControls();
   renderDecoder();
 }
 
@@ -834,7 +1048,9 @@ async function retuneLive(frequencyHz) {
       body: JSON.stringify({ frequencyMhz }),
     });
   } catch (error) {
-    elements.tuningMarker.style.left = '50%';
+    elements.tuningMarker.style.left = `${livePlotX(
+      0.5, elements.liveVisual.getBoundingClientRect().width,
+    )}px`;
     toast(error.message, 'error');
   }
 }
@@ -846,8 +1062,10 @@ function positionLiveChannelMarker() {
     ? Math.max(0, Math.min(1,
       0.5 + (channelHz - state.centerHz) / state.sampleRate))
     : 0.5;
-  elements.tuningMarker.style.left = `${ratio * 100}%`;
+  const visualWidth = elements.liveVisual.getBoundingClientRect().width;
+  elements.tuningMarker.style.left = `${livePlotX(ratio, visualWidth)}px`;
   elements.tuningTooltip.textContent = formatFrequency(channelHz, 4);
+  updateChannelFrequencyReadout(channelHz);
   updateFilterBand();
 }
 
@@ -871,15 +1089,48 @@ async function selectLiveChannel(frequencyHz) {
   }
 }
 
+function tuneLiveChannelWithWheel(event) {
+  if (state.mode !== 'live' || event.deltaY === 0) return;
+  const spectrumRect = elements.spectrumCanvas.getBoundingClientRect();
+  const waterfallRect = elements.waterfallCanvas.getBoundingClientRect();
+  const overSpectrum = event.clientY >= spectrumRect.top && event.clientY <= spectrumRect.bottom;
+  const overWaterfall = event.clientY >= waterfallRect.top && event.clientY <= waterfallRect.bottom;
+  if (!overSpectrum && !overWaterfall) return;
+
+  event.preventDefault();
+  const direction = event.deltaY < 0 ? 1 : -1;
+  const baseFrequencyHz = Number.isFinite(state.channelHz) ? state.channelHz : state.centerHz;
+  const halfSpanHz = Math.max(0, state.sampleRate / 2);
+  const minimumHz = state.centerHz - halfSpanHz;
+  const maximumHz = state.centerHz + halfSpanHz;
+  const frequencyHz = Math.min(maximumHz, Math.max(minimumHz,
+    Math.round(baseFrequencyHz + direction * CHANNEL_WHEEL_STEP_HZ)));
+
+  state.channelHz = frequencyHz;
+  positionLiveChannelMarker();
+  if (elements.protocol.value === 'voice') renderVoiceDecoder();
+
+  elements.tuningMarker.classList.add('wheel-tuning');
+  clearTimeout(channelWheelFeedbackTimer);
+  channelWheelFeedbackTimer = setTimeout(() => {
+    elements.tuningMarker.classList.remove('wheel-tuning');
+  }, 650);
+
+  clearTimeout(channelWheelCommitTimer);
+  channelWheelCommitTimer = setTimeout(() => {
+    void selectLiveChannel(frequencyHz);
+  }, 80);
+}
+
 function previewLiveTune(clientX) {
   const tune = state.liveTune;
   if (!tune.rect) return;
-  const ratio = Math.max(0, Math.min(1,
-    (clientX - tune.rect.left) / tune.rect.width));
+  const ratio = livePlotRatio(clientX, tune.rect);
   tune.frequencyHz = tune.centerHz - tune.sampleRate / 2
                      + ratio * tune.sampleRate;
-  elements.tuningMarker.style.left = `${ratio * 100}%`;
+  elements.tuningMarker.style.left = `${livePlotX(ratio, tune.rect.width)}px`;
   elements.tuningTooltip.textContent = formatFrequency(tune.frequencyHz, 4);
+  updateChannelFrequencyReadout(tune.frequencyHz);
   updateFilterBand(tune.frequencyHz);
 }
 
@@ -1057,6 +1308,18 @@ function addLog(message, level = 'info') {
 function handleState(message) {
   state.processMode = message.mode;
   state.processStatus = message.status;
+  if (message.audioRecording) state.recordings.audio = { ...message.audioRecording };
+  if (message.iqRecording) state.recordings.iq = { ...message.iqRecording };
+  if (typeof message.manualGain === 'boolean') {
+    elements.gainAuto.checked = !message.manualGain;
+    elements.gainInput.disabled = !message.manualGain;
+  }
+  if (Number.isFinite(message.gainDb)) elements.gainInput.value = String(message.gainDb);
+  if (Object.hasOwn(message, 'appliedGainDb')) {
+    state.appliedGainDb = Number.isFinite(message.appliedGainDb)
+      ? message.appliedGainDb : null;
+  }
+  renderGainOutput();
   if (message.mode === 'live' && Number.isFinite(message.frequencyMhz)) {
     state.centerHz = message.frequencyMhz * 1e6;
     state.channelHz = Number.isFinite(message.channelFrequencyMhz)
@@ -1088,6 +1351,7 @@ function handleState(message) {
   elements.connectionLight.className = `connection-light ${active ? 'active' : message.status === 'error' ? 'error' : ''}`;
   if (message.status === 'error' || message.status === 'complete' || message.status === 'stopped') setBusy(false);
   if (message.progress !== undefined) updateScanProgress(message.progress);
+  renderRecordingControls();
 }
 
 function handleSpectrum(message) {
@@ -1157,6 +1421,7 @@ function connectEvents() {
       else if (message.type === 'receiver_status') handleReceiverStatus(message);
       else if (message.type === 'tuned') handleTuned(message);
       else if (message.type === 'channel_tuned') handleChannelTuned(message);
+      else if (message.type === 'gain_failed') toast(message.message || 'Modifica gain non riuscita', 'error');
       else if (message.type === 'scan_tile') handleScanTile(message);
       else if (message.type === 'decoder') handleDecoder(message.payload || {});
       else if (message.type === 'diagnostic') addLog(message.message, message.level);
@@ -1192,6 +1457,9 @@ elements.modeButtons.forEach((button) => button.addEventListener('click', () => 
 elements.start.addEventListener('click', startCurrentMode);
 elements.stop.addEventListener('click', stopSession);
 elements.refreshDevices.addEventListener('click', refreshDevices);
+elements.copyChannelFrequency.addEventListener('click', copyChannelFrequencyHz);
+elements.audioRecordingButton.addEventListener('click', () => toggleRecording('audio'));
+elements.iqRecordingButton.addEventListener('click', () => toggleRecording('iq'));
 elements.protocol.addEventListener('change', () => {
   syncFrequencyEditor(protocolDefaults[elements.protocol.value] * 1e6);
   updateProtocolControls();
@@ -1230,13 +1498,23 @@ elements.frequencyDigits.addEventListener('wheel', (event) => {
 }, { passive: false });
 elements.scanStart.addEventListener('input', () => setMode('scan'));
 elements.scanEnd.addEventListener('input', () => setMode('scan'));
-elements.gainAuto.addEventListener('change', () => { elements.gainInput.disabled = elements.gainAuto.checked; });
-elements.gainInput.addEventListener('input', () => { elements.gainOutput.textContent = `${elements.gainInput.value} dB`; });
+elements.gainAuto.addEventListener('change', () => {
+  elements.gainInput.disabled = elements.gainAuto.checked;
+  state.appliedGainDb = null;
+  void updateRuntimeGain();
+});
+elements.gainInput.addEventListener('input', () => {
+  state.appliedGainDb = null;
+  renderGainOutput();
+  scheduleRuntimeGain();
+});
+elements.gainInput.addEventListener('change', updateRuntimeGain);
 elements.fpsInput.addEventListener('input', () => { elements.fpsOutput.textContent = `${elements.fpsInput.value} FPS`; });
 
 [elements.spectrumCanvas, elements.waterfallCanvas].forEach((canvas) => {
   canvas.addEventListener('pointerdown', beginLiveTune);
 });
+elements.liveVisual.addEventListener('wheel', tuneLiveChannelWithWheel, { passive: false });
 elements.tuningMarker.addEventListener('pointerdown', beginLiveTune);
 elements.filterHandleLeft.addEventListener('pointerdown', beginFilterResize);
 elements.filterHandleRight.addEventListener('pointerdown', beginFilterResize);
@@ -1301,7 +1579,7 @@ $$('.decoder-tab').forEach((tab) => tab.addEventListener('click', () => {
 window.addEventListener('resize', () => {
   scheduleSpectrumDraw();
   scheduleScanDraw();
-  updateFilterBand();
+  positionLiveChannelMarker();
 });
 
 buildFrequencyEditor();
@@ -1312,3 +1590,4 @@ drawSpectrum();
 drawScan();
 connectEvents();
 refreshDevices();
+renderGainOutput();

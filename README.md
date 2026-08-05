@@ -118,6 +118,52 @@ stato aperto/chiuso. Come punto di partenza è consigliata una soglia di
 `-30 dBFS`; va poi regolata rispetto al rumore realmente indicato (una soglia
 più negativa apre più facilmente lo squelch).
 
+### Registrazione audio e I/Q
+
+Il pannello **Registrazione** può avviare e fermare i file durante una sessione
+Live, senza riavviare il ricevitore. In modalità Voice l'audio viene prelevato
+dopo demodulazione, de-enfasi e squelch, quindi coincide con ciò che viene
+riprodotto. La registrazione I/Q è invece presa direttamente dai campioni del
+dongle, prima di FFT, filtro di canale e decoder, ed è disponibile per tutti i
+protocolli Live.
+
+Per l'audio sono disponibili:
+
+- `wav-s16`: WAV mono PCM 16-bit a 48 kHz, scelta consigliata e più compatibile;
+- `wav-f32`: WAV mono IEEE Float 32-bit, utile per elaborazioni successive;
+- `s16le` e `f32le`: PCM raw senza header, per pipeline e strumenti DSP.
+
+I formati comuni per le registrazioni raw SDR inclusi nella GUI sono:
+
+| Formato | Byte per campione I/Q | Uso principale |
+| --- | ---: | --- |
+| `cu8` | 2 | Byte originali RTL-SDR, file compatti e replay diretto |
+| `cs16le` | 4 | Ampia interoperabilità con software SDR |
+| `cf32le` | 8 | Elaborazione numerica e DSP senza riconversione |
+| `wav-iq-s16` | 4 | I e Q nei due canali PCM; compatibile con strumenti che leggono WAV I/Q |
+| `sigmf-cu8` | 2 | CU8 più file `.sigmf-meta` con sample-rate, frequenza e cambi di sintonia |
+
+A 2,4 MS/s occupano circa 4,8 MB/s in CU8, 9,6 MB/s in CS16/WAV I/Q e
+19,2 MB/s in CF32. Il WAV RIFF standard è limitato a 4 GB ed è quindi indicato
+per acquisizioni brevi; per archiviazione e scambio è consigliato SigMF, mentre
+CU8 è la scelta più semplice e compatta. Lasciando vuoto il percorso, la GUI
+genera un nome con timestamp nella cartella `registrazioni/`.
+
+Le stesse funzioni sono disponibili dalla CLI e possono essere usate insieme:
+
+```sh
+./rtl-universal 145.500 --mode voice --demod fm \
+  --record-audio registrazioni/voice.wav --audio-format wav-s16 \
+  --record-iq registrazioni/canale.sigmf-data --iq-format sigmf-cu8
+```
+
+Per un'acquisizione IQ CU8 compatta:
+
+```sh
+./rtl-universal 1090 --mode adsb \
+  --record-iq registrazioni/adsb.cu8 --iq-format cu8
+```
+
 ### FFT live dalla CLI
 
 `--spectrum` abilita il tap FFT. Se lo spettro va su stdout occorre usare
